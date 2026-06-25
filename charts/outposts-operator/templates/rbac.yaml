@@ -1,0 +1,42 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "outposts-operator.fullname" . }}
+  labels:
+    {{- include "outposts-operator.labels" . | nindent 4 }}
+rules:
+  # Reconcile the operator's own custom resources + status.
+  - apiGroups: ["outposts.cognition.ai"]
+    resources: ["outpostpools", "outpostpools/status", "outpostpools/finalizers"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Manage one worker Pod per claimed session.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # Read the per-pool token Secret.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Emit events for observability.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # TODO: snapshot resources (e.g. snapshot.storage.k8s.io VolumeSnapshots,
+  # GKE pod snapshots) once the snapshot providers are implemented.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "outposts-operator.fullname" . }}
+  labels:
+    {{- include "outposts-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "outposts-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "outposts-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

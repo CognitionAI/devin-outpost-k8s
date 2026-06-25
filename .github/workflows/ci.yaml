@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: check
+        run: cargo check --all-targets
+      - name: crd is up to date
+        run: |
+          cargo run --bin crdgen > /tmp/crd.json
+          diff -u charts/outposts-operator/files/crd-outpostpool.json /tmp/crd.json
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: lint
+        run: helm lint charts/outposts-operator
+      - name: template (default)
+        run: helm template charts/outposts-operator
+      - name: template (default pool)
+        run: |
+          helm template charts/outposts-operator \
+            --set defaultPool.enabled=true \
+            --set defaultPool.poolId=pool_ci \
+            --set defaultPool.token.value=dummy

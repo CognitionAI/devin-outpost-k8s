@@ -1,0 +1,50 @@
+# Example OutpostPool. Apply after installing the operator + CRD.
+#
+#   kubectl create secret generic my-pool-token --from-literal=token=<PAT>
+#   kubectl apply -f examples/outpostpool.yaml
+apiVersion: outposts.cognition.ai/v1alpha1
+kind: OutpostPool
+metadata:
+  name: example
+spec:
+  # Upstream Outposts pool ID this resource serves.
+  poolId: "pool_example"
+
+  # Secret holding the account PAT (UseOutpostsMachine permission).
+  tokenSecretRef:
+    name: my-pool-token
+    key: token
+
+  # Optional API base URL override.
+  # apiUrl: "https://api.devin.ai"
+
+  maxConcurrentSessions: 10
+
+  # StartFresh | GkeSnapshot | FilesystemSnapshot
+  resumePolicy: StartFresh
+
+  worker:
+    # PLACEHOLDER image until the lightweight devin-CLI worker image is published.
+    image: ghcr.io/usacognition/devin-worker:latest
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    # Schedule workers onto a dedicated node pool.
+    nodeSelector:
+      cloud.google.com/gke-nodepool: outposts
+    # Sandbox with gVisor (or "kata"); omit for the cluster default runtime.
+    runtimeClassName: gvisor
+    # GKE Autopilot example knobs.
+    annotations:
+      autopilot.gke.io/compute-class: Performance
+    labels:
+      team: outposts
+
+  snapshot:
+    enabled: false
+    # ttlSeconds: 86400

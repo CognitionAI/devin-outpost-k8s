@@ -1,0 +1,77 @@
+{{- if .Values.defaultPool.enabled -}}
+{{- $dp := .Values.defaultPool -}}
+{{- if not $dp.poolId -}}
+{{- fail "defaultPool.enabled=true requires defaultPool.poolId" -}}
+{{- end -}}
+{{- $secretName := $dp.token.existingSecret | default (printf "%s-default-pool-token" (include "outposts-operator.fullname" .)) -}}
+{{- if not $dp.token.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "outposts-operator.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ $dp.token.secretKey }}: {{ required "set defaultPool.token.value (or point defaultPool.token.existingSecret at a Secret)" $dp.token.value | quote }}
+---
+{{- end }}
+apiVersion: outposts.cognition.ai/v1alpha1
+kind: OutpostPool
+metadata:
+  name: {{ include "outposts-operator.fullname" . }}-default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "outposts-operator.labels" . | nindent 4 }}
+spec:
+  poolId: {{ $dp.poolId | quote }}
+  tokenSecretRef:
+    name: {{ $secretName }}
+    key: {{ $dp.token.secretKey }}
+  {{- with $dp.apiUrl }}
+  apiUrl: {{ . | quote }}
+  {{- end }}
+  maxConcurrentSessions: {{ $dp.maxConcurrentSessions }}
+  resumePolicy: {{ $dp.resumePolicy }}
+  worker:
+    image: {{ $dp.worker.image | quote }}
+    {{- with $dp.worker.imagePullPolicy }}
+    imagePullPolicy: {{ . }}
+    {{- end }}
+    {{- with $dp.worker.imagePullSecrets }}
+    imagePullSecrets:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $dp.worker.resources }}
+    resources:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $dp.worker.nodeSelector }}
+    nodeSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $dp.worker.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $dp.worker.runtimeClassName }}
+    runtimeClassName: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.worker.serviceAccountName }}
+    serviceAccountName: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.worker.annotations }}
+    annotations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $dp.worker.labels }}
+    labels:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  snapshot:
+    enabled: {{ $dp.snapshot.enabled }}
+    {{- with $dp.snapshot.ttlSeconds }}
+    ttlSeconds: {{ . }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,40 @@
+[package]
+name = "outposts-operator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "A Kubernetes operator that runs Devin Outposts (BYOB) workers on any certified Kubernetes cluster."
+repository = "https://github.com/usacognition/outposts-kubernetes"
+readme = "README.md"
+default-run = "outposts-operator"
+
+[[bin]]
+name = "outposts-operator"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+# Pin to the earliest API surface this k8s-openapi supports for the widest
+# cluster compatibility across GKE/EKS/etc. Bump deliberately, not via "latest".
+k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
+kube = { version = "4.0", features = ["runtime", "derive", "client"] }
+prometheus-client = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+schemars = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]

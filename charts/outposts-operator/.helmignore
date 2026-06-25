@@ -1,0 +1,5 @@
+*.tgz
+.git
+.gitignore
+*.bak
+*.tmp

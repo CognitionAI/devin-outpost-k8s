@@ -1,0 +1,117 @@
+# Default values for the outposts-operator chart.
+
+# -- Operator container image.
+image:
+  repository: ghcr.io/usacognition/outposts-operator
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for the operator deployment.
+imagePullSecrets: []
+
+# -- Number of operator replicas. Leader election is required for >1 (TODO).
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount for the operator.
+  create: true
+  # -- Annotations for the ServiceAccount (e.g. GKE Workload Identity binding).
+  annotations: {}
+  # -- Name to use; generated from the release name when empty.
+  name: ""
+
+rbac:
+  # -- Create the ClusterRole/ClusterRoleBinding the operator needs.
+  create: true
+
+# -- Resource requests/limits for the operator pod (not worker pods).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# -- Operator process settings.
+operator:
+  # -- Namespace to watch. Empty => all namespaces (cluster-wide).
+  watchNamespace: ""
+  # -- Default upstream Outposts API base URL when a pool does not override it.
+  defaultApiUrl: "https://api.devin.ai"
+  logFormat: text   # text | json
+  logLevel: info
+
+# -- Custom Resource Definition handling.
+crds:
+  # -- Install the OutpostPool CRD with this chart.
+  install: true
+
+metrics:
+  # -- Expose the Prometheus /metrics endpoint via a Service.
+  service:
+    enabled: true
+    port: 8080
+  # -- Create a Prometheus Operator ServiceMonitor.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# -- Easy path: deploy a single OutpostPool alongside the operator so a fresh
+# install is functional with just a pool ID and token. Set defaultPool.enabled
+# to false to manage OutpostPool resources yourself.
+defaultPool:
+  enabled: false
+  # -- Upstream pool ID to serve.
+  poolId: ""
+  # -- API URL override for this pool (falls back to operator.defaultApiUrl).
+  apiUrl: ""
+  # -- Max sessions this pool runs concurrently.
+  maxConcurrentSessions: 10
+  # -- How resume sessions are handled: StartFresh | GkeSnapshot | FilesystemSnapshot
+  resumePolicy: StartFresh
+
+  token:
+    # -- Account PAT (UseOutpostsMachine). When existingSecret is empty, a Secret
+    # is created from this value. Prefer existingSecret over inlining the PAT.
+    value: ""
+    # -- Use a pre-existing Secret instead of creating one from value above.
+    existingSecret: ""
+    secretKey: token
+
+  worker:
+    # -- Worker image bundling the devin CLI. PLACEHOLDER until published.
+    image: ghcr.io/usacognition/devin-worker:latest
+    imagePullPolicy: IfNotPresent
+    imagePullSecrets: []
+    # -- Pod resource requests/limits for each worker (global per pool).
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    nodeSelector: {}
+    tolerations: []
+    # -- Sandbox runtime class (e.g. gvisor, kata). Empty => cluster default.
+    runtimeClassName: ""
+    serviceAccountName: ""
+    # -- Extra annotations on worker pods (e.g. GKE Autopilot compute class).
+    annotations: {}
+    # -- Extra labels on worker pods.
+    labels: {}
+
+  snapshot:
+    enabled: false
+    ttlSeconds: null
