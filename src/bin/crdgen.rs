@@ -4,11 +4,11 @@
 //! generated file can live next to the chart's YAML templates:
 //!
 //! ```sh
-//! cargo run --bin crdgen > charts/outposts-operator/crds/outpostpool.yaml
+//! cargo run --bin crdgen > charts/devin-outposts-k8s/crds/outpostpool.yaml
 //! ```
 
 use kube::CustomResourceExt;
-use outposts_operator::crd::OutpostPool;
+use devin_outposts_k8s::crd::OutpostPool;
 
 fn main() -> anyhow::Result<()> {
     let crd = OutpostPool::crd();

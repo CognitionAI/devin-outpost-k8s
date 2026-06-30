@@ -1,12 +1,6 @@
 //! Cloud-portable snapshot/restore abstraction used to back `resume` sessions.
 //!
 //! The [`crate::crd::ResumePolicy`] selects which provider a pool uses:
-//!
-//! - [`StartFresh`](crate::crd::ResumePolicy::StartFresh) -> [`noop::NoopSnapshotProvider`]
-//! - [`GkeSnapshot`](crate::crd::ResumePolicy::GkeSnapshot) -> [`gke::GkeSnapshotProvider`]
-//! - [`FilesystemSnapshot`](crate::crd::ResumePolicy::FilesystemSnapshot) -> [`filesystem::FilesystemSnapshotProvider`]
-//!
-//! All providers are scaffolds; methods return [`crate::Error::NotImplemented`].
 
 mod filesystem;
 mod gke;

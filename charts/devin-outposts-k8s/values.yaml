@@ -1,15 +1,15 @@
-# Default values for the outposts-operator chart.
+# Default values for the devin-outposts-k8s chart.
 
 # -- Operator container image.
 image:
-  repository: ghcr.io/usacognition/outposts-operator
+  repository: ghcr.io/usacognition/devin-outposts-k8s
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
 # -- Image pull secrets for the operator deployment.
 imagePullSecrets: []
 
-# -- Number of operator replicas. Leader election is required for >1 (TODO).
+# -- Number of operator replicas. Must be 1; leader election for >1 is not yet supported.
 replicaCount: 1
 
 nameOverride: ""

@@ -13,12 +13,12 @@ pub enum Error {
     NotImplemented(&'static str),
 
     /// Error talking to the Kubernetes API server.
-    #[error("kube api error: {0}")]
+    #[error("k8s api error: {0}")]
     Kube(#[from] kube::Error),
 
     /// Error talking to the upstream `/opbeta` Outposts queue API.
-    #[error("opbeta api error: {0}")]
-    OpBeta(#[from] reqwest::Error),
+    #[error("api error: {0}")]
+    Api(#[from] reqwest::Error),
 
     /// A claim conflicted with another worker (HTTP 409).
     ///

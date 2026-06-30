@@ -1,7 +1,7 @@
-//! # outposts-operator
+//! # devin-outposts-k8s
 //!
 //! A Kubernetes operator that runs **Devin Outposts** ("Bring Your Own Box")
-//! workers on any certified Kubernetes cluster (GKE, EKS, ...).
+//! workers on Kubernetes (GKE, EKS, kubeadm, ...).
 //!
 //! The Devin control plane exposes a deliberately Kubernetes-shaped, account
 //! scoped queue API under `/opbeta/outposts` (list + watch + claim/release).
@@ -12,21 +12,16 @@
 //!
 //! ## Crate layout
 //!
-//! - [`opbeta`]   — typed client + models for the upstream `/opbeta` queue API.
-//! - [`crd`]      — the [`crd::OutpostPool`] custom resource (operator config).
-//! - [`controller`] — the reconcile loop and per-session `Pod` template builder.
-//! - [`snapshot`] — the cloud-portable snapshot/restore provider abstraction
+//! - [`api`]         — typed client + models for the upstream queue API
+//! - [`crd`]         — the [`crd::OutpostPool`] custom resource
+//! - [`controller`]  — the reconcile loop and per-session `Pod` template builder
+//! - [`snapshot`]    — the cloud-portable snapshot/restore provider abstraction
 //!   used to back `resume` sessions (GKE pod snapshots, filesystem, no-op).
 //! - [`metrics`] / [`telemetry`] — Prometheus metrics and tracing setup.
-//! - [`config`]   — process-level runtime configuration.
-//! - [`error`]    — the crate error type.
-//!
-//! > **Status: scaffold.** Types and module boundaries are defined here, but the
-//! > behavioural logic is intentionally stubbed (`Error::NotImplemented` /
-//! > `todo!()`). See `docs/ARCHITECTURE.md` for the intended design.
+//! - [`config`]      — process-level runtime configuration
+//! - [`error`]       — the crate error type
 
-// This is a scaffold: many items are defined ahead of the code that will use
-// them. Remove this once the controller logic is implemented.
+// CR-soon nikhil: Remove once implemented.
 #![allow(dead_code)]
 
 pub mod config;
@@ -34,17 +29,17 @@ pub mod controller;
 pub mod crd;
 pub mod error;
 pub mod metrics;
-pub mod opbeta;
+pub mod api;
 pub mod snapshot;
 pub mod telemetry;
 
 pub use error::{Error, Result};
 
 /// API group used by all custom resources owned by this operator.
-pub const API_GROUP: &str = "outposts.cognition.ai";
+pub const API_GROUP: &str = "outposts.cognition.com";
 
 /// API version currently served for [`crd::OutpostPool`].
 pub const API_VERSION: &str = "v1alpha1";
 
 /// Default manager/field-manager name used for server-side apply.
-pub const MANAGER_NAME: &str = "outposts-operator";
+pub const MANAGER_NAME: &str = "devin-outposts-k8s";

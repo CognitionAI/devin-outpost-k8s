@@ -3,7 +3,7 @@
 //! Portable fallback for non-GKE clusters: persist the worker's state directory
 //! to a retained volume / `VolumeSnapshot` and re-mount it on resume.
 //!
-//! TODO: implement using the CSI `VolumeSnapshot` API (or a retained
+//! CR-soon nikhil: implement using the CSI `VolumeSnapshot` API (or a retained
 //! `PersistentVolumeClaim`), honouring the pool's snapshot TTL.
 
 use async_trait::async_trait;

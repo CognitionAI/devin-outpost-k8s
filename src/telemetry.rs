@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// otherwise a human-friendly format.
 pub fn init() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,outposts_operator=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,devin_outposts_k8s=debug"));
 
     let json = std::env::var("LOG_FORMAT").as_deref() == Ok("json");
 

@@ -14,7 +14,14 @@ use k8s_openapi::api::core::v1::Pod;
 
 use crate::crd::OutpostPool;
 use crate::error::{Error, Result};
-use crate::opbeta::OutpostDevin;
+use crate::api::OutpostDevin;
+
+/// Default worker image used when a pool's `worker.image` is unset.
+///
+/// PLACEHOLDER until the lightweight `devin` CLI/worker image is published; the
+/// operator deployment should pin this (via config) to the image matching its
+/// own release. See `docs/ARCHITECTURE.md`.
+pub const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/usacognition/devin-worker:latest";
 
 /// Env var carrying the outpost gateway public websocket URL.
 pub const ENV_GATEWAY_URL: &str = "DEVIN_OUTPOST_GATEWAY_URL";
@@ -34,15 +41,31 @@ pub struct WorkerPodParams<'a> {
     pub gateway_url: &'a str,
     /// Connect token returned by the claim.
     pub connect_token: &'a str,
+    /// Operator-wide default worker image, used when the pool's `worker.image`
+    /// is unset (see [`DEFAULT_WORKER_IMAGE`] / [`crate::config::OperatorConfig`]).
+    pub default_image: &'a str,
 }
 
 /// Build the worker `Pod` for one claimed session.
 ///
-/// TODO: assemble metadata (name/labels/annotations, owner reference to the
-/// pool), the worker container (image, resources, env contract above), and
-/// scheduling (`nodeSelector`, `tolerations`, `runtimeClassName`,
-/// `serviceAccountName`, GKE Autopilot annotations) from
-/// [`crate::crd::WorkerTemplate`].
+/// The pool's [`crate::crd::WorkerTemplate`] is assembled in three layers (see
+/// its docs). The intended algorithm:
+///
+/// 1. **Base:** start from `worker.template`
+///    ([`k8s_openapi::api::core::v1::PodTemplateSpec`]) — carry over its `spec`,
+///    `nodeSelector`, `tolerations`, `runtimeClassName`, `serviceAccountName`,
+///    volumes, sidecars, pod metadata, etc.
+/// 2. **Operator vars:** find the container named `worker.container_name`
+///    (default `devin-worker`), inserting an empty one if absent. Set its
+///    `image` to `default_image`, set the worker command/args, and inject the
+///    env contract above (`ENV_GATEWAY_URL`/`ENV_CONNECT_TOKEN`/`ENV_SESSION_ID`
+///    from the claim). Set `restartPolicy = Never`, and attach a deterministic
+///    pod name, identifying labels/annotations, and an owner reference to the
+///    pool for GC.
+/// 3. **Overrides:** apply `worker.overrides`. Each `Some` field wins over the
+///    layer-2 value: `image`, `command`, `args`, `restart_policy`, and the pod
+///    `labels`/`annotations` (which *replace* the operator's merged set). The
+///    pod name and owner reference stay operator-owned and are never overridden.
 pub fn build_worker_pod(_params: WorkerPodParams<'_>) -> Result<Pod> {
     Err(Error::todo("controller::build_worker_pod"))
 }

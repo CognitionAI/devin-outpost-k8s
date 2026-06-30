@@ -1,4 +1,4 @@
-//! Wire models for the `/opbeta/outposts` API.
+//! Wire models for the `outposts` API.
 //!
 //! These mirror the Pydantic response models in
 //! `devin-webapp/apps/webserver/app/routers/opbeta/outposts_router.py` and the

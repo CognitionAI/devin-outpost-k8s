@@ -2,12 +2,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "outposts-operator.fullname" . }}
+  name: {{ include "devin-outposts-k8s.fullname" . }}
   labels:
-    {{- include "outposts-operator.labels" . | nindent 4 }}
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
 rules:
   # Reconcile the operator's own custom resources + status.
-  - apiGroups: ["outposts.cognition.ai"]
+  - apiGroups: ["outposts.cognition.com"]
     resources: ["outpostpools", "outpostpools/status", "outpostpools/finalizers"]
     verbs: ["get", "list", "watch", "update", "patch"]
   # Manage one worker Pod per claimed session.
@@ -22,21 +22,21 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # TODO: snapshot resources (e.g. snapshot.storage.k8s.io VolumeSnapshots,
+  # CR-soon nikhil: snapshot resources (e.g. snapshot.storage.k8s.io VolumeSnapshots,
   # GKE pod snapshots) once the snapshot providers are implemented.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "outposts-operator.fullname" . }}
+  name: {{ include "devin-outposts-k8s.fullname" . }}
   labels:
-    {{- include "outposts-operator.labels" . | nindent 4 }}
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "outposts-operator.fullname" . }}
+  name: {{ include "devin-outposts-k8s.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "outposts-operator.serviceAccountName" . }}
+    name: {{ include "devin-outposts-k8s.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}

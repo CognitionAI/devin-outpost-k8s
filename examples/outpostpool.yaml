@@ -2,7 +2,7 @@
 #
 #   kubectl create secret generic my-pool-token --from-literal=token=<PAT>
 #   kubectl apply -f examples/outpostpool.yaml
-apiVersion: outposts.cognition.ai/v1alpha1
+apiVersion: outposts.cognition.com/v1alpha1
 kind: OutpostPool
 metadata:
   name: example
@@ -23,27 +23,62 @@ spec:
   # StartFresh | GkeSnapshot | FilesystemSnapshot
   resumePolicy: StartFresh
 
+  # The worker pod is built in three layers: (1) your `template`, (2) the vars
+  # the operator injects onto the worker container, (3) your `overrides` which
+  # get the final say over what the operator injected.
   worker:
-    # PLACEHOLDER image until the lightweight devin-CLI worker image is published.
-    image: ghcr.io/usacognition/devin-worker:latest
-    imagePullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: "1"
-        memory: 2Gi
-      limits:
-        cpu: "2"
-        memory: 4Gi
-    # Schedule workers onto a dedicated node pool.
-    nodeSelector:
-      cloud.google.com/gke-nodepool: outposts
-    # Sandbox with gVisor (or "kata"); omit for the cluster default runtime.
-    runtimeClassName: gvisor
-    # GKE Autopilot example knobs.
-    annotations:
-      autopilot.gke.io/compute-class: Performance
-    labels:
-      team: outposts
+    # Layer 1 — base pod template. Put anything pod/container-level here; the
+    # operator overlays its worker container on top.
+    template:
+      metadata:
+        # GKE Autopilot example knobs. The operator merges its own identifying
+        # annotations on top unless you override them below.
+        annotations:
+          autopilot.gke.io/compute-class: Performance
+        labels:
+          team: outposts
+      spec:
+        # Sandbox with gVisor (or "kata"); omit for the cluster default runtime.
+        runtimeClassName: gvisor
+        # Schedule workers onto a dedicated node pool.
+        nodeSelector:
+          cloud.google.com/gke-nodepool: outposts
+        containers:
+          # Must match `containerName` below (or its "devin-worker" default).
+          # image/command/env are managed by the operator; everything else here
+          # (resources, volumeMounts, securityContext, …) is yours.
+          - name: devin-worker
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "1"
+                memory: 2Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+
+    # Which container the operator treats as the worker (default "devin-worker").
+    # containerName: devin-worker
+
+    # Layer 3 — final-say overrides over what the operator injects. All optional;
+    # omit the whole block to accept the operator's defaults.
+    overrides:
+      # Pin the worker image. When unset, the operator's configured default
+      # worker image (pinned to its release) is used. PLACEHOLDER until the
+      # lightweight devin-CLI worker image is published.
+      # image: ghcr.io/usacognition/devin-worker:latest
+
+      # Swap the worker entrypoint / args.
+      # command: ["/usr/local/bin/devin"]
+      # args: ["worker"]
+
+      # Replace the pod labels/annotations the operator would merge ({} = none).
+      # labels: {}
+      # annotations: {}
+
+      # Override the operator's restartPolicy (default "Never"). Footgun: the
+      # operator manages the pod lifecycle, so change this deliberately.
+      # restartPolicy: Never
 
   snapshot:
     enabled: false

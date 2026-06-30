@@ -1,5 +1,5 @@
 apiVersion: v2
-name: outposts-operator
+name: devin-outposts-k8s
 description: Kubernetes operator that runs Devin Outposts (BYOB) workers on any certified Kubernetes cluster.
 type: application
 # Chart version; bump on chart changes.

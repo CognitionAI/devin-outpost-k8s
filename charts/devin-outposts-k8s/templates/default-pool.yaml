@@ -3,7 +3,7 @@
 {{- if not $dp.poolId -}}
 {{- fail "defaultPool.enabled=true requires defaultPool.poolId" -}}
 {{- end -}}
-{{- $secretName := $dp.token.existingSecret | default (printf "%s-default-pool-token" (include "outposts-operator.fullname" .)) -}}
+{{- $secretName := $dp.token.existingSecret | default (printf "%s-default-pool-token" (include "devin-outposts-k8s.fullname" .)) -}}
 {{- if not $dp.token.existingSecret }}
 apiVersion: v1
 kind: Secret
@@ -11,19 +11,19 @@ metadata:
   name: {{ $secretName }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "outposts-operator.labels" . | nindent 4 }}
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
 type: Opaque
 stringData:
   {{ $dp.token.secretKey }}: {{ required "set defaultPool.token.value (or point defaultPool.token.existingSecret at a Secret)" $dp.token.value | quote }}
 ---
 {{- end }}
-apiVersion: outposts.cognition.ai/v1alpha1
+apiVersion: outposts.cognition.com/v1alpha1
 kind: OutpostPool
 metadata:
-  name: {{ include "outposts-operator.fullname" . }}-default
+  name: {{ include "devin-outposts-k8s.fullname" . }}-default
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "outposts-operator.labels" . | nindent 4 }}
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
 spec:
   poolId: {{ $dp.poolId | quote }}
   tokenSecretRef:

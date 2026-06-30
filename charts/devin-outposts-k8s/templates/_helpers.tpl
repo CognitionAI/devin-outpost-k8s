@@ -1,10 +1,10 @@
 {{/* Expand the name of the chart. */}}
-{{- define "outposts-operator.name" -}}
+{{- define "devin-outposts-k8s.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* Fully qualified app name. */}}
-{{- define "outposts-operator.fullname" -}}
+{{- define "devin-outposts-k8s.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
@@ -18,9 +18,9 @@
 {{- end -}}
 
 {{/* Common labels. */}}
-{{- define "outposts-operator.labels" -}}
+{{- define "devin-outposts-k8s.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
-{{ include "outposts-operator.selectorLabels" . }}
+{{ include "devin-outposts-k8s.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -28,15 +28,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/* Selector labels. */}}
-{{- define "outposts-operator.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "outposts-operator.name" . }}
+{{- define "devin-outposts-k8s.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "devin-outposts-k8s.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/* ServiceAccount name. */}}
-{{- define "outposts-operator.serviceAccountName" -}}
+{{- define "devin-outposts-k8s.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
-{{- default (include "outposts-operator.fullname" .) .Values.serviceAccount.name -}}
+{{- default (include "devin-outposts-k8s.fullname" .) .Values.serviceAccount.name -}}
 {{- else -}}
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}

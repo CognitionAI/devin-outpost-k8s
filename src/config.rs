@@ -16,8 +16,13 @@ pub struct OperatorConfig {
     /// Optional namespace to restrict the operator to. `None` => cluster-wide.
     pub watch_namespace: Option<String>,
 
-    /// Default upstream `/opbeta` API base URL when a pool does not override it.
+    /// Default upstream API base URL when an [`crate::crd::OutpostPool`] does
+    /// not override it.
     pub default_api_url: String,
+
+    /// Default worker image used when a pool's `worker.image` is unset. Pinned to
+    /// the operator release (typically set via the Helm chart).
+    pub default_worker_image: String,
 
     /// How long to wait between full re-list/reconcile passes of a pool's queue.
     pub reconcile_interval: Duration,
@@ -31,7 +36,8 @@ impl Default for OperatorConfig {
         Self {
             metrics_addr: ([0, 0, 0, 0], 8080).into(),
             watch_namespace: None,
-            default_api_url: crate::opbeta::DEFAULT_API_URL.to_string(),
+            default_api_url: crate::api::DEFAULT_API_URL.to_string(),
+            default_worker_image: crate::controller::DEFAULT_WORKER_IMAGE.to_string(),
             reconcile_interval: Duration::from_secs(30),
             claim_renew_margin: Duration::from_secs(60),
         }
@@ -41,7 +47,8 @@ impl Default for OperatorConfig {
 impl OperatorConfig {
     /// Build configuration from the process environment.
     ///
-    /// TODO: parse `METRICS_ADDR`, `WATCH_NAMESPACE`, `DEVIN_API_URL`, etc.
+    /// CR-soon nikhil: parse `METRICS_ADDR`, `WATCH_NAMESPACE`, `DEVIN_API_URL`,
+    /// `DEVIN_WORKER_IMAGE`, etc.
     pub fn from_env() -> crate::Result<Self> {
         // Scaffold: real env parsing comes with the runtime implementation.
         Ok(Self::default())

@@ -41,7 +41,7 @@ impl OutpostsClient {
     ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
-                .user_agent(concat!("outposts-operator/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("devin-outposts-k8s/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             base_url: base_url.into(),
             token: token.into(),
@@ -57,14 +57,14 @@ impl OutpostsClient {
     /// List a page of queued sessions for `pool_id`, optionally resuming from
     /// `cursor`.
     ///
-    /// TODO: `GET {base}/opbeta/outposts/devins?pool={pool}&cursor={cursor}`.
+    /// CR-soon nikhil: `GET {base}/opbeta/outposts/devins?pool={pool}&cursor={cursor}`.
     pub async fn list(&self, _pool_id: &str, _cursor: Option<&str>) -> Result<DevinList> {
         Err(Error::todo("OutpostsClient::list"))
     }
 
     /// Open a watch stream for `pool_id` starting from `cursor`.
     ///
-    /// TODO: `GET .../devins?pool={pool}&watch=true&cursor={cursor}` as SSE,
+    /// CR-soon nikhil: `GET .../devins?pool={pool}&watch=true&cursor={cursor}` as SSE,
     /// decoded into [`WatchEvent`]s, with reconnect-on-cursor semantics.
     pub fn watch(
         &self,
@@ -78,7 +78,7 @@ impl OutpostsClient {
 
     /// Claim (or renew, if already held by this `acceptor_id`) a session.
     ///
-    /// TODO: `POST .../devins/{id}/claim`; map HTTP 409 to
+    /// CR-soon nikhil: `POST .../devins/{id}/claim`; map HTTP 409 to
     /// [`Error::ClaimConflict`].
     pub async fn claim(&self, session_id: &str) -> Result<ClaimResponse> {
         let _ = session_id;
@@ -87,14 +87,14 @@ impl OutpostsClient {
 
     /// Release a session back to the queue.
     ///
-    /// TODO: `POST .../devins/{id}/release`.
+    /// CR-soon nikhil: `POST .../devins/{id}/release`.
     pub async fn release(&self, _session_id: &str) -> Result<()> {
         Err(Error::todo("OutpostsClient::release"))
     }
 
     /// List the pools visible to this token.
     ///
-    /// TODO: `GET .../pools`.
+    /// CR-soon nikhil: `GET .../pools`.
     pub async fn list_pools(&self) -> Result<Vec<Pool>> {
         Err(Error::todo("OutpostsClient::list_pools"))
     }

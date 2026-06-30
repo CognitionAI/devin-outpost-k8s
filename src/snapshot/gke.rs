@@ -2,9 +2,6 @@
 //!
 //! Backed by GKE Pod snapshots:
 //! <https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots>
-//!
-//! TODO: snapshot a suspended worker pod and restore it on resume, honouring the
-//! pool's [`crate::crd::SnapshotPolicy`] (enablement + TTL). GKE only.
 
 use async_trait::async_trait;
 

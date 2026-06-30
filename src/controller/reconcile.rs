@@ -29,7 +29,7 @@ pub async fn run(ctx: Context) -> crate::Result<()> {
 
     let ctx = Arc::new(ctx);
     Controller::new(pools, watcher::Config::default())
-        // TODO: `.owns::<Pod>(...)` once worker pods are created.
+        // CR-soon nikhil: `.owns::<Pod>(...)` once worker pods are created.
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             match res {
@@ -44,7 +44,7 @@ pub async fn run(ctx: Context) -> crate::Result<()> {
 
 /// Reconcile a single [`OutpostPool`].
 ///
-/// TODO: authenticate with the pool PAT, list/watch the upstream queue, claim up
+/// CR-soon nikhil: authenticate with the pool PAT, list/watch the upstream queue, claim up
 /// to `maxConcurrentSessions`, create/renew/tear down worker pods, update status.
 pub async fn reconcile(pool: Arc<OutpostPool>, _ctx: Arc<Context>) -> crate::Result<Action> {
     warn!(

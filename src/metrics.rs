@@ -1,8 +1,7 @@
 //! Prometheus metrics and the metrics/health HTTP server.
 //!
-//! Uses `prometheus-client` and exposes an OpenMetrics endpoint, which is
-//! portable across clouds (scraped by Prometheus, GMP on GKE, etc.). The Helm
-//! chart ships an optional `ServiceMonitor`.
+//! Uses `prometheus-client` and exposes an OpenMetrics endpoint. The Helm chart
+//! ships an optional `ServiceMonitor`.
 
 use std::sync::Arc;
 

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{LocalObjectReference, ResourceRequirements, Toleration};
+use k8s_openapi::api::core::v1::PodTemplateSpec;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// One operator deployment reconciles many `OutpostPool` resources.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
-    group = "outposts.cognition.ai",
+    group = "outposts.cognition.com",
     version = "v1alpha1",
     kind = "OutpostPool",
     plural = "outpostpools",
@@ -72,53 +72,83 @@ pub struct SecretKeyRef {
 
 /// The per-session worker `Pod` template.
 ///
-/// These fields shape the `Pod` the operator creates for each claimed session.
-/// Cloud-specific knobs (GKE Autopilot annotations/labels, runtime class for
-/// gVisor/Kata) live here so a single operator can serve heterogeneous pools.
+/// The pod is assembled in three layers, applied in order:
+///
+/// 1. **`template`** — your base [`PodTemplateSpec`]. Put anything
+///    pod/container-level you need here (resources, env, volumes,
+///    `nodeSelector`, `tolerations`, `runtimeClassName`, `serviceAccountName`,
+///    `securityContext`, `affinity`, sidecars, pod metadata, …). A single
+///    operator can serve heterogeneous pools because every cloud-specific knob
+///    is expressible here.
+/// 2. **operator vars** — the operator merges the bits it must own onto the
+///    worker container (`containerName`): the worker image + command, the
+///    per-claim `DEVIN_OUTPOST_*` env, a non-restarting pod policy, and
+///    identifying pod metadata + an owner reference for GC.
+/// 3. **`overrides`** — your final say. Each `Some` field in [`WorkerOverrides`]
+///    wins over the operator var from layer 2, so a pool can pin the image, swap
+///    the entrypoint, or stop the operator's labels/annotations from being
+///    applied. The pod name and owner reference are always operator-owned and
+///    cannot be overridden.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerTemplate {
-    /// Container image bundling the `devin` CLI / worker.
-    pub image: String,
+    /// Layer 1: the base pod template the operator overlays the worker container
+    /// onto.
+    #[serde(default)]
+    pub template: PodTemplateSpec,
 
-    /// Image pull policy (`Always` | `IfNotPresent` | `Never`).
+    /// Name of the container in `template` the operator treats as the worker: it
+    /// merges its image/command/env onto this container, creating it if the
+    /// template doesn't define one by this name. Other containers in the
+    /// template are left as-is and run as sidecars.
+    #[serde(default = "default_worker_container_name")]
+    pub container_name: String,
+
+    /// Layer 3: final-say overrides over the fields the operator otherwise owns.
+    #[serde(default)]
+    pub overrides: WorkerOverrides,
+}
+
+/// Final-say overrides over the fields the operator otherwise owns (layer 3 in
+/// [`WorkerTemplate`]).
+///
+/// Every field is optional: a `Some` value takes precedence over the operator's
+/// own value for that field, while `None` leaves the operator in control. This
+/// keeps the set of operator-owned knobs explicit and lets a pool opt out of any
+/// one of them individually instead of accepting all of them wholesale.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerOverrides {
+    /// Worker container image. When unset the operator uses its configured
+    /// default worker image (pinned to the operator release).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_pull_policy: Option<String>,
+    pub image: Option<String>,
 
-    /// Image pull secrets for private registries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub image_pull_secrets: Vec<LocalObjectReference>,
-
-    /// CPU/memory (and other) resource requests + limits for the worker
-    /// container. Global per pool for now.
+    /// Entrypoint for the worker container, replacing the operator's default
+    /// worker command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<ResourceRequirements>,
+    pub command: Option<Vec<String>>,
 
-    /// Node selector applied to worker pods.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub node_selector: BTreeMap<String, String>,
-
-    /// Tolerations applied to worker pods.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tolerations: Vec<Toleration>,
-
-    /// RuntimeClass name for sandboxing (e.g. `gvisor`, `kata`). When unset the
-    /// cluster default runtime is used.
+    /// Args for the worker container, replacing the operator's default args.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_class_name: Option<String>,
+    pub args: Option<Vec<String>>,
 
-    /// ServiceAccount for worker pods. Defaults to the namespace default.
+    /// Pod `restartPolicy`. The operator defaults to `Never`; override only if
+    /// you understand the lifecycle implications — the operator deletes pods as
+    /// sessions terminate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_account_name: Option<String>,
+    pub restart_policy: Option<String>,
 
-    /// Extra annotations merged onto every worker pod. Useful for GKE Autopilot
-    /// (e.g. compute-class / scheduling hints) and similar cloud knobs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub annotations: BTreeMap<String, String>,
+    /// Pod labels. When set, these *replace* the labels the operator would
+    /// otherwise merge (use `{}` to apply none of them). The owner reference is
+    /// always added regardless, so garbage collection still works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
 
-    /// Extra labels merged onto every worker pod.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+    /// Pod annotations. When set, these *replace* the annotations the operator
+    /// would otherwise merge (use `{}` to apply none of them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// Strategy for serving `resume`-kind sessions.
@@ -199,4 +229,23 @@ fn default_max_concurrent_sessions() -> u32 {
 
 fn default_token_key() -> String {
     "token".to_string()
+}
+
+fn default_worker_container_name() -> String {
+    "devin-worker".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutpostPool;
+    use kube::Resource;
+
+    /// The `#[kube(group = ..., version = ...)]` derive attributes must be
+    /// string literals, so they can't reference [`crate::API_GROUP`] /
+    /// [`crate::API_VERSION`] directly. Assert they stay in sync instead.
+    #[test]
+    fn crd_identity_matches_crate_constants() {
+        assert_eq!(OutpostPool::group(&()), crate::API_GROUP);
+        assert_eq!(OutpostPool::version(&()), crate::API_VERSION);
+    }
 }

@@ -1,19 +1,22 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount must be 1: leader election is not yet supported (TODO)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "outposts-operator.fullname" . }}
+  name: {{ include "devin-outposts-k8s.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "outposts-operator.labels" . | nindent 4 }}
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "outposts-operator.selectorLabels" . | nindent 6 }}
+      {{- include "devin-outposts-k8s.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "outposts-operator.labels" . | nindent 8 }}
+        {{- include "devin-outposts-k8s.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -22,7 +25,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "outposts-operator.serviceAccountName" . }}
+      serviceAccountName: {{ include "devin-outposts-k8s.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
