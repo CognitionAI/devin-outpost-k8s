@@ -1,5 +1,5 @@
 {{- if gt (int .Values.replicaCount) 1 }}
-{{- fail "replicaCount must be 1: leader election is not yet supported (TODO)" }}
+{{- fail "replicaCount must be 1: Lease-based leader election is planned but not implemented yet" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -34,8 +34,6 @@ spec:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - --health-probe-bind-address=:{{ .Values.metrics.service.port }}
           env:
             - name: METRICS_ADDR
               value: ":{{ .Values.metrics.service.port }}"
@@ -43,6 +41,10 @@ spec:
               value: {{ .Values.operator.watchNamespace | quote }}
             - name: DEVIN_API_URL
               value: {{ .Values.operator.defaultApiUrl | quote }}
+            - name: DEVIN_WORKER_IMAGE
+              value: {{ .Values.operator.defaultWorkerImage | quote }}
+            - name: ACCEPTOR_ID
+              value: {{ .Values.operator.acceptorId | quote }}
             - name: LOG_FORMAT
               value: {{ .Values.operator.logFormat | quote }}
             - name: RUST_LOG

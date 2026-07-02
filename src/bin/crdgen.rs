@@ -7,8 +7,8 @@
 //! cargo run --bin crdgen > charts/devin-outposts-k8s/crds/outpostpool.yaml
 //! ```
 
-use kube::CustomResourceExt;
 use devin_outposts_k8s::crd::OutpostPool;
+use kube::CustomResourceExt;
 
 fn main() -> anyhow::Result<()> {
     let crd = OutpostPool::crd();

@@ -20,8 +20,12 @@ spec:
 
   maxConcurrentSessions: 10
 
-  # StartFresh | GkeSnapshot | FilesystemSnapshot
-  resumePolicy: StartFresh
+  # How resume-kind sessions are served. The policy alone decides whether
+  # snapshots are taken on suspend: StartFresh | GkeSnapshot | FilesystemSnapshot.
+  resume:
+    policy: StartFresh
+    # Snapshot retention in seconds; omit to keep until the session terminates.
+    # snapshotTtlSeconds: 86400
 
   # The worker pod is built in three layers: (1) your `template`, (2) the vars
   # the operator injects onto the worker container, (3) your `overrides` which
@@ -62,24 +66,19 @@ spec:
 
     # Layer 3 — final-say overrides over what the operator injects. All optional;
     # omit the whole block to accept the operator's defaults.
-    overrides:
-      # Pin the worker image. When unset, the operator's configured default
-      # worker image (pinned to its release) is used. PLACEHOLDER until the
-      # lightweight devin-CLI worker image is published.
-      # image: ghcr.io/usacognition/devin-worker:latest
-
-      # Swap the worker entrypoint / args.
-      # command: ["/usr/local/bin/devin"]
-      # args: ["worker"]
-
-      # Replace the pod labels/annotations the operator would merge ({} = none).
-      # labels: {}
-      # annotations: {}
-
-      # Override the operator's restartPolicy (default "Never"). Footgun: the
-      # operator manages the pod lifecycle, so change this deliberately.
-      # restartPolicy: Never
-
-  snapshot:
-    enabled: false
-    # ttlSeconds: 86400
+    # overrides:
+    #   # Pin the worker image. When unset, the operator's configured default
+    #   # worker image (pinned to its release) is used.
+    #   image: public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016
+    #
+    #   # Swap the worker entrypoint / args (default: devin worker --session <id> --once).
+    #   command: ["/usr/local/bin/devin"]
+    #   args: ["worker", "--session", "<id>", "--once"]
+    #
+    #   # Replace the pod labels/annotations the operator would merge ({} = none).
+    #   labels: {}
+    #   annotations: {}
+    #
+    #   # Override the operator's restartPolicy (default "OnFailure"). Footgun:
+    #   # the operator manages the pod lifecycle, so change this deliberately.
+    #   restartPolicy: OnFailure

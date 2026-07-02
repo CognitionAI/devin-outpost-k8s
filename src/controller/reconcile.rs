@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use kube::api::Api;
+use kube::runtime::Controller;
 use kube::runtime::controller::Action;
 use kube::runtime::watcher;
-use kube::runtime::Controller;
 use tracing::{info, warn};
 
 use crate::crd::OutpostPool;
@@ -45,7 +45,9 @@ pub async fn run(ctx: Context) -> crate::Result<()> {
 /// Reconcile a single [`OutpostPool`].
 ///
 /// CR-soon nikhil: authenticate with the pool PAT, list/watch the upstream queue, claim up
-/// to `maxConcurrentSessions`, create/renew/tear down worker pods, update status.
+/// to `maxConcurrentSessions`, create/renew/tear down worker pods per the
+/// lifecycle mapping in [`crate::controller`], handle
+/// [`crate::controller::POOL_FINALIZER`], update status.
 pub async fn reconcile(pool: Arc<OutpostPool>, _ctx: Arc<Context>) -> crate::Result<Action> {
     warn!(
         pool = %pool.spec.pool_id,

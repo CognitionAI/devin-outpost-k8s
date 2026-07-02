@@ -4,7 +4,7 @@
 //! to a retained volume / `VolumeSnapshot` and re-mount it on resume.
 //!
 //! CR-soon nikhil: implement using the CSI `VolumeSnapshot` API (or a retained
-//! `PersistentVolumeClaim`), honouring the pool's snapshot TTL.
+//! `PersistentVolumeClaim`), honouring the pool's `resume.snapshotTtlSeconds`.
 
 use async_trait::async_trait;
 

@@ -49,14 +49,9 @@ pub struct OutpostPoolSpec {
     /// The worker `Pod` template applied to every claimed session.
     pub worker: WorkerTemplate,
 
-    /// How `resume`-kind sessions are handled for this pool.
+    /// How `resume`-kind sessions are served for this pool.
     #[serde(default)]
-    pub resume_policy: ResumePolicy,
-
-    /// Snapshot policy used to back resumes / idle cost savings. Disabled by
-    /// default.
-    #[serde(default)]
-    pub snapshot: SnapshotPolicy,
+    pub resume: ResumeConfig,
 }
 
 /// A reference to a single key within a `Secret` in the same namespace.
@@ -133,9 +128,10 @@ pub struct WorkerOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
 
-    /// Pod `restartPolicy`. The operator defaults to `Never`; override only if
-    /// you understand the lifecycle implications — the operator deletes pods as
-    /// sessions terminate.
+    /// Pod `restartPolicy`. The operator defaults to `OnFailure` (see
+    /// [`crate::controller`] for the lifecycle mapping); override only if you
+    /// understand the implications — the operator deletes pods as sessions
+    /// terminate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<String>,
 
@@ -151,11 +147,36 @@ pub struct WorkerOverrides {
     pub annotations: Option<BTreeMap<String, String>>,
 }
 
-/// Strategy for serving `resume`-kind sessions.
+/// How `resume`-kind sessions are served, and the snapshotting that backs
+/// them.
+///
+/// A single block (rather than separate policy + `snapshot.enabled` knobs) so
+/// that contradictory configurations — a snapshotting policy with snapshots
+/// disabled — are unrepresentable. The [`ResumePolicy`] alone decides whether
+/// snapshots are taken.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeConfig {
+    /// Strategy for serving resume-kind sessions.
+    #[serde(default)]
+    pub policy: ResumePolicy,
+
+    /// How long a snapshot is retained before being garbage collected, in
+    /// seconds. `None` => keep until the session is terminated. Only
+    /// meaningful for policies that snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_ttl_seconds: Option<u64>,
+}
+
+/// Strategy for serving `resume`-kind sessions. Policies other than
+/// [`ResumePolicy::StartFresh`] snapshot the worker when its session is
+/// suspended and restore from that snapshot on resume (see
+/// [`crate::snapshot`]).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
 pub enum ResumePolicy {
     /// Ignore prior state and start the worker fresh. The simplest, fully
-    /// portable option, and the default.
+    /// portable option, and the default. Resumes still function, but the prior
+    /// filesystem state is gone.
     #[default]
     StartFresh,
     /// Restore the pod from a GKE pod snapshot taken on suspend. GKE only.
@@ -163,20 +184,6 @@ pub enum ResumePolicy {
     /// Restore session state from a persistent filesystem snapshot (e.g. a
     /// retained `PersistentVolume`). Portable across providers.
     FilesystemSnapshot,
-}
-
-/// Snapshot policy controlling whether/when worker state is snapshotted.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotPolicy {
-    /// Whether snapshotting is enabled at all. Defaults to `false`.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// How long a snapshot is retained before being garbage collected, in
-    /// seconds. `None` => keep until the session is terminated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_seconds: Option<u64>,
 }
 
 /// Observed state of an [`OutpostPool`].

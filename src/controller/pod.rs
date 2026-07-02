@@ -1,34 +1,56 @@
 //! Per-session worker `Pod` template builder (scaffold).
 //!
 //! For each claimed session the operator creates one owned `Pod` running the
-//! `devin` worker image. The worker spawns `devin-remote` in *connect-back*
-//! mode: it dials the outpost gateway's public leg using the short-lived connect
-//! token from the claim, and the brain attaches over the gateway's internal leg.
+//! `devin` CLI worker. The worker dials the outpost gateway's public leg using
+//! the connect token from the claim, and the brain attaches over the gateway's
+//! internal leg.
 //!
-//! The container env the worker/remote expects mirrors the reference worker in
-//! `devin-webapp/apps/chisel/chisel/src/worker/runner.rs`. The relevant values
-//! (gateway URL, connect token, session id) come from the claim response, not
-//! from static config — so this builder takes them as inputs.
+//! ## Operator ↔ worker-image contract
+//!
+//! This module is the single source of truth for the contract between the
+//! operator and the worker image; the image (a lightweight Dockerfile bundling
+//! the `devin` CLI, published from the CLI's regular release flow) must stay
+//! in sync with it.
+//!
+//! - The operator runs [`WORKER_COMMAND`] with args
+//!   `["worker", "--session", <session_id>, "--once"]` — `--once` means the
+//!   process serves exactly one session and exits `0` when it completes.
+//! - [`ENV_SESSION_TOKEN`] carries the gateway connect token, injected via
+//!   `secretKeyRef` from a per-session `Secret` (see
+//!   [`build_session_token_secret`]) rather than inline in the pod spec, so it
+//!   isn't readable by everyone with `pods get`.
+//! - [`ENV_GATEWAY_URL`] carries the gateway public websocket URL from the
+//!   claim.
+//! - [`ENV_REMOTE_BINARY_SHA`] carries `spec.remote_binary_sha` when the queue
+//!   item pins one; unset otherwise.
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 
+use crate::api::OutpostDevin;
 use crate::crd::OutpostPool;
 use crate::error::{Error, Result};
-use crate::api::OutpostDevin;
 
-/// Default worker image used when a pool's `worker.image` is unset.
+/// Default worker image used when a pool's `worker.overrides.image` is unset.
 ///
-/// PLACEHOLDER until the lightweight `devin` CLI/worker image is published; the
-/// operator deployment should pin this (via config) to the image matching its
-/// own release. See `docs/ARCHITECTURE.md`.
-pub const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/usacognition/devin-worker:latest";
+/// CR-soon nikhil: "there's probably a better tag to use later"; the operator
+/// deployment should eventually pin this (via config) to the image matching its
+/// own release.
+pub const DEFAULT_WORKER_IMAGE: &str = "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016";
+
+/// Entrypoint the operator sets on the worker container. Kept separate from
+/// the args so `worker.overrides.args` can tweak flags without repeating the
+/// binary (and `worker.overrides.command` can swap the binary itself).
+pub const WORKER_COMMAND: &str = "devin";
 
 /// Env var carrying the outpost gateway public websocket URL.
-pub const ENV_GATEWAY_URL: &str = "DEVIN_OUTPOST_GATEWAY_URL";
-/// Env var carrying the short-lived gateway connect token.
-pub const ENV_CONNECT_TOKEN: &str = "DEVIN_OUTPOST_CONNECT_TOKEN";
-/// Env var carrying the session (devin) ID.
-pub const ENV_SESSION_ID: &str = "DEVIN_OUTPOST_SESSION_ID";
+pub const ENV_GATEWAY_URL: &str = "DEVIN_REMOTE_GATEWAY_URL";
+/// Env var carrying the gateway connect token (via the per-session `Secret`).
+pub const ENV_SESSION_TOKEN: &str = "DEVIN_REMOTE_SESSION_TOKEN";
+/// Env var carrying `spec.remote_binary_sha`, when set.
+pub const ENV_REMOTE_BINARY_SHA: &str = "DEVIN_REMOTE_BINARY_SHA";
+
+/// Key under which the connect token is stored in the per-session `Secret`.
+pub const SESSION_TOKEN_SECRET_KEY: &str = "token";
 
 /// Inputs needed to render a worker pod for one claimed session.
 #[derive(Debug, Clone)]
@@ -39,11 +61,26 @@ pub struct WorkerPodParams<'a> {
     pub session: &'a OutpostDevin,
     /// Gateway public URL returned by the claim.
     pub gateway_url: &'a str,
-    /// Connect token returned by the claim.
-    pub connect_token: &'a str,
-    /// Operator-wide default worker image, used when the pool's `worker.image`
-    /// is unset (see [`DEFAULT_WORKER_IMAGE`] / [`crate::config::OperatorConfig`]).
+    /// Name of the per-session `Secret` (from [`build_session_token_secret`])
+    /// holding the connect token under [`SESSION_TOKEN_SECRET_KEY`].
+    pub token_secret_name: &'a str,
+    /// Operator-wide default worker image, used when the pool's
+    /// `worker.overrides.image` is unset (see [`DEFAULT_WORKER_IMAGE`] /
+    /// [`crate::config::OperatorConfig`]).
     pub default_image: &'a str,
+}
+
+/// Build the per-session `Secret` holding the gateway connect token under
+/// [`SESSION_TOKEN_SECRET_KEY`].
+///
+/// Labeled with the session ID and owner-referenced to the pool; the operator
+/// deletes it together with the worker pod.
+pub fn build_session_token_secret(
+    _pool: &OutpostPool,
+    _session: &OutpostDevin,
+    _connect_token: &str,
+) -> Result<Secret> {
+    Err(Error::todo("controller::build_session_token_secret"))
 }
 
 /// Build the worker `Pod` for one claimed session.
@@ -57,11 +94,10 @@ pub struct WorkerPodParams<'a> {
 ///    volumes, sidecars, pod metadata, etc.
 /// 2. **Operator vars:** find the container named `worker.container_name`
 ///    (default `devin-worker`), inserting an empty one if absent. Set its
-///    `image` to `default_image`, set the worker command/args, and inject the
-///    env contract above (`ENV_GATEWAY_URL`/`ENV_CONNECT_TOKEN`/`ENV_SESSION_ID`
-///    from the claim). Set `restartPolicy = Never`, and attach a deterministic
-///    pod name, identifying labels/annotations, and an owner reference to the
-///    pool for GC.
+///    `image` to `default_image`, its command/args and env per the module-level
+///    contract. Set `restartPolicy = OnFailure` (see the lifecycle mapping in
+///    [`crate::controller`]), and attach a deterministic pod name, identifying
+///    labels/annotations, and an owner reference to the pool for GC.
 /// 3. **Overrides:** apply `worker.overrides`. Each `Some` field wins over the
 ///    layer-2 value: `image`, `command`, `args`, `restart_policy`, and the pod
 ///    `labels`/`annotations` (which *replace* the operator's merged set). The

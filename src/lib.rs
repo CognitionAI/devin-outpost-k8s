@@ -24,12 +24,12 @@
 // CR-soon nikhil: Remove once implemented.
 #![allow(dead_code)]
 
+pub mod api;
 pub mod config;
 pub mod controller;
 pub mod crd;
 pub mod error;
 pub mod metrics;
-pub mod api;
 pub mod snapshot;
 pub mod telemetry;
 

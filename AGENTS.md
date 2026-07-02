@@ -4,9 +4,9 @@ All documentation for this codebase exists in the actual code as a rustdoc, with
 
 - A piece of information should exist as a comment in exactly one place, and referenced from other places.
 - Variable names should be self-descriptive as much as possible, to avoid needing a comment to begin with.
-- If a human said something to you in the way as for reasoning for a change, it's probably a good idea to write down in one place, minimally, as close to the way they said it as possible (even as a direct quote with authorship information is reasonable, e.g. "// Ethan said 'foo'").
+- If a human said something to you in the way as for reasoning for a change, it's probably a good idea to write down in one place, minimally, as close to the way they said it as possible.
 
-Comments should explain specific constraints that were needed to build the software.
+Comments should explain specific constraints that were part of the spec for the software.
 
 Example (cartoonishly BAD, do not do this):
 ```rust

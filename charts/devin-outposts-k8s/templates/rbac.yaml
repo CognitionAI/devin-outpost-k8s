@@ -14,10 +14,19 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "create", "delete", "patch"]
-  # Read the per-pool token Secret.
+  # Read the per-pool token Secret; create/delete the per-session connect-token
+  # Secrets injected into worker pods.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Persist the generated acceptor ID (when operator.acceptorId is unset).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update"]
+  # Leader election (planned; see the controller docs).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
   # Emit events for observability.
   - apiGroups: [""]
     resources: ["events"]

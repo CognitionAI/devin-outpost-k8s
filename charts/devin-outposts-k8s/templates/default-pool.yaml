@@ -33,45 +33,54 @@ spec:
   apiUrl: {{ . | quote }}
   {{- end }}
   maxConcurrentSessions: {{ $dp.maxConcurrentSessions }}
-  resumePolicy: {{ $dp.resumePolicy }}
+  resume:
+    policy: {{ $dp.resume.policy }}
+    {{- with $dp.resume.snapshotTtlSeconds }}
+    snapshotTtlSeconds: {{ . }}
+    {{- end }}
+  # The flat defaultPool.worker.* values are rendered into the layered worker
+  # template the CRD expects (see examples/outpostpool.yaml for the full shape).
   worker:
-    image: {{ $dp.worker.image | quote }}
-    {{- with $dp.worker.imagePullPolicy }}
-    imagePullPolicy: {{ . }}
-    {{- end }}
-    {{- with $dp.worker.imagePullSecrets }}
-    imagePullSecrets:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with $dp.worker.resources }}
-    resources:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with $dp.worker.nodeSelector }}
-    nodeSelector:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with $dp.worker.tolerations }}
-    tolerations:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with $dp.worker.runtimeClassName }}
-    runtimeClassName: {{ . | quote }}
-    {{- end }}
-    {{- with $dp.worker.serviceAccountName }}
-    serviceAccountName: {{ . | quote }}
-    {{- end }}
-    {{- with $dp.worker.annotations }}
-    annotations:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with $dp.worker.labels }}
-    labels:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-  snapshot:
-    enabled: {{ $dp.snapshot.enabled }}
-    {{- with $dp.snapshot.ttlSeconds }}
-    ttlSeconds: {{ . }}
+    template:
+      {{- if or $dp.worker.annotations $dp.worker.labels }}
+      metadata:
+        {{- with $dp.worker.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.labels }}
+        labels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      spec:
+        {{- with $dp.worker.runtimeClassName }}
+        runtimeClassName: {{ . | quote }}
+        {{- end }}
+        {{- with $dp.worker.serviceAccountName }}
+        serviceAccountName: {{ . | quote }}
+        {{- end }}
+        {{- with $dp.worker.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.imagePullSecrets }}
+        imagePullSecrets:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        containers:
+          - name: devin-worker
+            imagePullPolicy: {{ $dp.worker.imagePullPolicy }}
+            {{- with $dp.worker.resources }}
+            resources:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+    {{- if $dp.worker.image }}
+    overrides:
+      image: {{ $dp.worker.image | quote }}
     {{- end }}
 {{- end }}

@@ -18,7 +18,9 @@ pub struct OutpostsClient {
     base_url: String,
     /// PAT with the `UseOutpostsMachine` permission. Never logged.
     token: String,
-    /// Stable identity used when claiming/renewing; one per worker identity.
+    /// Identity used when claiming/renewing; see
+    /// [`crate::config::OperatorConfig::acceptor_id`] for its stability and
+    /// uniqueness requirements.
     acceptor_id: String,
 }
 

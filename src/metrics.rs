@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::Router;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -38,6 +38,8 @@ pub struct Metrics {
     pub claim_conflicts: Family<PoolLabels, Counter>,
     /// Currently running worker pods, by pool.
     pub active_workers: Family<PoolLabels, Gauge>,
+    /// Total worker pod restarts observed (non-zero exits), by pool.
+    pub worker_restarts: Family<PoolLabels, Counter>,
 }
 
 impl Default for Metrics {
@@ -56,6 +58,7 @@ impl Metrics {
         let sessions_claimed = Family::<PoolLabels, Counter>::default();
         let claim_conflicts = Family::<PoolLabels, Counter>::default();
         let active_workers = Family::<PoolLabels, Gauge>::default();
+        let worker_restarts = Family::<PoolLabels, Counter>::default();
 
         registry.register(
             "reconciliations",
@@ -82,6 +85,11 @@ impl Metrics {
             "Worker pods currently running",
             active_workers.clone(),
         );
+        registry.register(
+            "worker_restarts",
+            "Worker pod restarts observed (non-zero exits)",
+            worker_restarts.clone(),
+        );
 
         Self {
             registry,
@@ -90,6 +98,7 @@ impl Metrics {
             sessions_claimed,
             claim_conflicts,
             active_workers,
+            worker_restarts,
         }
     }
 

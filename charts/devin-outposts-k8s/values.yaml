@@ -2,14 +2,16 @@
 
 # -- Operator container image.
 image:
-  repository: ghcr.io/usacognition/devin-outposts-k8s
-  tag: ""            # defaults to .Chart.AppVersion
+  # CR-soon nikhil: replace with the release registry/tag once publishing settles.
+  repository: public.ecr.aws/e0h8a4b6/devin-k8s-controller
+  tag: "latest"      # empty => .Chart.AppVersion
   pullPolicy: IfNotPresent
 
 # -- Image pull secrets for the operator deployment.
 imagePullSecrets: []
 
-# -- Number of operator replicas. Must be 1; leader election for >1 is not yet supported.
+# -- Number of operator replicas. Must be 1 until Lease-based leader election
+# lands (planned; failover must stay inside the ~5min upstream claim TTL).
 replicaCount: 1
 
 nameOverride: ""
@@ -48,6 +50,13 @@ operator:
   watchNamespace: ""
   # -- Default upstream Outposts API base URL when a pool does not override it.
   defaultApiUrl: "https://api.devin.ai"
+  # -- Identity used when claiming sessions upstream; must be unique within the
+  # account and stable for this install. Empty => the operator generates one and
+  # persists it in a ConfigMap.
+  acceptorId: ""
+  # -- Default worker image when a pool does not pin one (worker.overrides.image).
+  # CR-soon nikhil: "there's probably a better tag to use later".
+  defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016"
   logFormat: text   # text | json
   logLevel: info
 
@@ -78,8 +87,14 @@ defaultPool:
   apiUrl: ""
   # -- Max sessions this pool runs concurrently.
   maxConcurrentSessions: 10
-  # -- How resume sessions are handled: StartFresh | GkeSnapshot | FilesystemSnapshot
-  resumePolicy: StartFresh
+
+  # -- How resume-kind sessions are served.
+  resume:
+    # -- StartFresh | GkeSnapshot | FilesystemSnapshot. The policy alone decides
+    # whether snapshots are taken on suspend.
+    policy: StartFresh
+    # -- Snapshot retention in seconds. Empty => keep until session terminated.
+    snapshotTtlSeconds: null
 
   token:
     # -- Account PAT (UseOutpostsMachine). When existingSecret is empty, a Secret
@@ -89,9 +104,11 @@ defaultPool:
     existingSecret: ""
     secretKey: token
 
+  # -- Convenience knobs rendered into the OutpostPool's layered worker template
+  # (see examples/outpostpool.yaml for the full shape).
   worker:
-    # -- Worker image bundling the devin CLI. PLACEHOLDER until published.
-    image: ghcr.io/usacognition/devin-worker:latest
+    # -- Pin the worker image for this pool. Empty => operator.defaultWorkerImage.
+    image: ""
     imagePullPolicy: IfNotPresent
     imagePullSecrets: []
     # -- Pod resource requests/limits for each worker (global per pool).
@@ -111,7 +128,3 @@ defaultPool:
     annotations: {}
     # -- Extra labels on worker pods.
     labels: {}
-
-  snapshot:
-    enabled: false
-    ttlSeconds: null

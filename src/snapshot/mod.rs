@@ -1,6 +1,9 @@
 //! Cloud-portable snapshot/restore abstraction used to back `resume` sessions.
 //!
-//! The [`crate::crd::ResumePolicy`] selects which provider a pool uses:
+//! The [`crate::crd::ResumePolicy`] alone selects which provider a pool uses
+//! and whether snapshots are taken at all. When and why providers are invoked
+//! (suspend → snapshot then delete pod, resume → restore) is documented in the
+//! lifecycle mapping in [`crate::controller`].
 
 mod filesystem;
 mod gke;
@@ -40,7 +43,7 @@ pub trait SnapshotProvider: Send + Sync {
 
 /// Construct the snapshot provider implied by a pool's [`ResumePolicy`].
 pub fn provider_for(pool: &OutpostPool) -> Box<dyn SnapshotProvider> {
-    match pool.spec.resume_policy {
+    match pool.spec.resume.policy {
         ResumePolicy::StartFresh => Box::new(NoopSnapshotProvider),
         ResumePolicy::GkeSnapshot => Box::new(GkeSnapshotProvider),
         ResumePolicy::FilesystemSnapshot => Box::new(FilesystemSnapshotProvider),
