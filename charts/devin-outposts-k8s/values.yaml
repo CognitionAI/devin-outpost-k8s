@@ -10,8 +10,9 @@ image:
 # -- Image pull secrets for the operator deployment.
 imagePullSecrets: []
 
-# -- Number of operator replicas. Must be 1 until Lease-based leader election
-# lands (planned; failover must stay inside the ~5min upstream claim TTL).
+# -- Number of operator replicas. One replica leads (via a coordination.k8s.io
+# Lease) while the rest stand by; failover stays well inside the ~5min
+# upstream claim TTL.
 replicaCount: 1
 
 nameOverride: ""
@@ -95,6 +96,13 @@ defaultPool:
     policy: StartFresh
     # -- Snapshot retention in seconds. Empty => keep until session terminated.
     snapshotTtlSeconds: null
+    # -- Per-session state volume size (FilesystemSnapshot only). Empty => 20Gi.
+    volumeSize: ""
+    # -- StorageClass for state volumes (FilesystemSnapshot only). Empty =>
+    # cluster default.
+    storageClassName: ""
+    # -- Name of an admin-provided PodSnapshotStorageConfig (GkeSnapshot only).
+    gkeStorageConfigName: ""
 
   token:
     # -- Account PAT (UseOutpostsMachine). When existingSecret is empty, a Secret

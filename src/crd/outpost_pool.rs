@@ -77,8 +77,9 @@ pub struct SecretKeyRef {
 ///    is expressible here.
 /// 2. **operator vars** — the operator merges the bits it must own onto the
 ///    worker container (`containerName`): the worker image + command, the
-///    per-claim `DEVIN_OUTPOST_*` env, a non-restarting pod policy, and
-///    identifying pod metadata + an owner reference for GC.
+///    per-claim env (see the contract in [`crate::controller`]'s pod module),
+///    `restartPolicy: OnFailure`, and identifying pod metadata + an owner
+///    reference for GC.
 /// 3. **`overrides`** — your final say. Each `Some` field in [`WorkerOverrides`]
 ///    wins over the operator var from layer 2, so a pool can pin the image, swap
 ///    the entrypoint, or stop the operator's labels/annotations from being
@@ -166,6 +167,32 @@ pub struct ResumeConfig {
     /// meaningful for policies that snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_ttl_seconds: Option<u64>,
+
+    /// Size of the per-session state volume created for the
+    /// [`ResumePolicy::FilesystemSnapshot`] policy (a Kubernetes quantity,
+    /// e.g. `20Gi`). Defaults to [`ResumeConfig::DEFAULT_VOLUME_SIZE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_size: Option<String>,
+
+    /// `StorageClass` for the per-session state volume
+    /// ([`ResumePolicy::FilesystemSnapshot`] only). `None` => the cluster
+    /// default class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+
+    /// Name of the `PodSnapshotStorageConfig` (in the pool's namespace) that
+    /// GKE pod snapshots are stored through. Required for the
+    /// [`ResumePolicy::GkeSnapshot`] policy; the storage config (and its GCS
+    /// bucket + Workload Identity IAM) is cluster-admin-provided, see
+    /// <https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gke_storage_config_name: Option<String>,
+}
+
+impl ResumeConfig {
+    /// Default size of the per-session state volume for
+    /// [`ResumePolicy::FilesystemSnapshot`].
+    pub const DEFAULT_VOLUME_SIZE: &str = "20Gi";
 }
 
 /// Strategy for serving `resume`-kind sessions. Policies other than

@@ -18,21 +18,24 @@ rules:
   # Secrets injected into worker pods.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
   # Persist the generated acceptor ID (when operator.acceptorId is unset).
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update"]
-  # Leader election (planned; see the controller docs).
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election (see the elector docs).
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
-  # Emit events for observability.
+  # Retained per-session state volumes (FilesystemSnapshot resume policy).
   - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
-  # CR-soon nikhil: snapshot resources (e.g. snapshot.storage.k8s.io VolumeSnapshots,
-  # GKE pod snapshots) once the snapshot providers are implemented.
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # GKE pod snapshots (GkeSnapshot resume policy). Absent from non-GKE
+  # clusters; the rule is inert there.
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

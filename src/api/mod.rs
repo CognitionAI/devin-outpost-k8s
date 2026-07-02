@@ -19,7 +19,7 @@
 mod client;
 mod types;
 
-pub use client::OutpostsClient;
+pub use client::{ListParams, OutpostsClient};
 pub use types::*;
 
 /// Default upstream API base URL (overridable per pool / via env).

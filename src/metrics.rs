@@ -38,8 +38,8 @@ pub struct Metrics {
     pub claim_conflicts: Family<PoolLabels, Counter>,
     /// Currently running worker pods, by pool.
     pub active_workers: Family<PoolLabels, Gauge>,
-    /// Total worker pod restarts observed (non-zero exits), by pool.
-    pub worker_restarts: Family<PoolLabels, Counter>,
+    /// Total workers given up on after exceeding the restart limit, by pool.
+    pub workers_given_up: Family<PoolLabels, Counter>,
 }
 
 impl Default for Metrics {
@@ -58,7 +58,7 @@ impl Metrics {
         let sessions_claimed = Family::<PoolLabels, Counter>::default();
         let claim_conflicts = Family::<PoolLabels, Counter>::default();
         let active_workers = Family::<PoolLabels, Gauge>::default();
-        let worker_restarts = Family::<PoolLabels, Counter>::default();
+        let workers_given_up = Family::<PoolLabels, Counter>::default();
 
         registry.register(
             "reconciliations",
@@ -86,9 +86,9 @@ impl Metrics {
             active_workers.clone(),
         );
         registry.register(
-            "worker_restarts",
-            "Worker pod restarts observed (non-zero exits)",
-            worker_restarts.clone(),
+            "workers_given_up",
+            "Workers given up on after exceeding the restart limit",
+            workers_given_up.clone(),
         );
 
         Self {
@@ -98,7 +98,7 @@ impl Metrics {
             sessions_claimed,
             claim_conflicts,
             active_workers,
-            worker_restarts,
+            workers_given_up,
         }
     }
 

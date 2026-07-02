@@ -8,10 +8,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Errors produced by the operator.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// A feature that is scaffolded but not yet implemented was invoked.
-    #[error("not implemented yet: {0}")]
-    NotImplemented(&'static str),
-
     /// Error talking to the Kubernetes API server.
     #[error("k8s api error: {0}")]
     Kube(#[from] kube::Error),
@@ -19,6 +15,15 @@ pub enum Error {
     /// Error talking to the upstream `/opbeta` Outposts queue API.
     #[error("api error: {0}")]
     Api(#[from] reqwest::Error),
+
+    /// The upstream API returned a non-success HTTP status.
+    #[error("api returned {status}: {message}")]
+    ApiStatus {
+        /// The HTTP status code.
+        status: reqwest::StatusCode,
+        /// The response body (usually a JSON `detail` message).
+        message: String,
+    },
 
     /// A claim conflicted with another worker (HTTP 409).
     ///
@@ -53,8 +58,24 @@ pub enum Error {
 }
 
 impl Error {
-    /// Convenience constructor for [`Error::NotImplemented`].
-    pub fn todo(what: &'static str) -> Self {
-        Error::NotImplemented(what)
+    /// Whether the upstream API rejected our credentials (401/403). Used to
+    /// surface an `Unauthorized` pool phase instead of a generic failure.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(
+            self,
+            Error::ApiStatus { status, .. }
+                if *status == reqwest::StatusCode::UNAUTHORIZED
+                    || *status == reqwest::StatusCode::FORBIDDEN
+        )
+    }
+
+    /// Whether the upstream API says the resource is gone (404). Claims and
+    /// releases race with queue tombstoning, so callers often treat this as
+    /// success.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Error::ApiStatus { status, .. } if *status == reqwest::StatusCode::NOT_FOUND
+        )
     }
 }

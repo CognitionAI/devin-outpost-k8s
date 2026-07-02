@@ -26,6 +26,14 @@ spec:
     policy: StartFresh
     # Snapshot retention in seconds; omit to keep until the session terminates.
     # snapshotTtlSeconds: 86400
+    #
+    # FilesystemSnapshot only — the per-session state volume:
+    # volumeSize: 20Gi
+    # storageClassName: premium-rwo
+    #
+    # GkeSnapshot only — an admin-provided PodSnapshotStorageConfig in this
+    # namespace (also requires runtimeClassName: gvisor on the worker):
+    # gkeStorageConfigName: my-storage-config
 
   # The worker pod is built in three layers: (1) your `template`, (2) the vars
   # the operator injects onto the worker container, (3) your `overrides` which
@@ -71,9 +79,9 @@ spec:
     #   # worker image (pinned to its release) is used.
     #   image: public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016
     #
-    #   # Swap the worker entrypoint / args (default: devin worker --session <id> --once).
+    #   # Swap the worker entrypoint / args (default: devin worker start --session <id>).
     #   command: ["/usr/local/bin/devin"]
-    #   args: ["worker", "--session", "<id>", "--once"]
+    #   args: ["worker", "start", "--session", "<id>"]
     #
     #   # Replace the pod labels/annotations the operator would merge ({} = none).
     #   labels: {}

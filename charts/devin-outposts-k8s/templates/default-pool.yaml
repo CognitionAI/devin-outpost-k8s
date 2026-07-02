@@ -38,6 +38,15 @@ spec:
     {{- with $dp.resume.snapshotTtlSeconds }}
     snapshotTtlSeconds: {{ . }}
     {{- end }}
+    {{- with $dp.resume.volumeSize }}
+    volumeSize: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.resume.storageClassName }}
+    storageClassName: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.resume.gkeStorageConfigName }}
+    gkeStorageConfigName: {{ . | quote }}
+    {{- end }}
   # The flat defaultPool.worker.* values are rendered into the layered worker
   # template the CRD expects (see examples/outpostpool.yaml for the full shape).
   worker:

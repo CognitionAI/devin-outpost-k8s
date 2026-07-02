@@ -4,9 +4,11 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-use super::{SnapshotHandle, SnapshotProvider};
+use super::{SnapshotOutcome, SnapshotProvider};
 
-/// Does nothing: resumes always start fresh. Fully portable.
+/// Does nothing: resumes always start fresh. Fully portable. The session
+/// still resumes (the cloud brain owns resume semantics); only the worker's
+/// filesystem state is gone.
 #[derive(Debug, Default, Clone)]
 pub struct NoopSnapshotProvider;
 
@@ -16,15 +18,23 @@ impl SnapshotProvider for NoopSnapshotProvider {
         "noop"
     }
 
-    async fn snapshot(&self, _session_id: &str) -> Result<SnapshotHandle> {
-        Ok(SnapshotHandle(String::new()))
-    }
-
-    async fn restore(&self, _session_id: &str) -> Result<Option<SnapshotHandle>> {
+    async fn prepare(&self, _session_id: &str) -> Result<Option<String>> {
         Ok(None)
     }
 
-    async fn delete(&self, _handle: &SnapshotHandle) -> Result<()> {
+    async fn on_suspend(
+        &self,
+        _session_id: &str,
+        _pod: &k8s_openapi::api::core::v1::Pod,
+    ) -> Result<SnapshotOutcome> {
+        Ok(SnapshotOutcome::Ready)
+    }
+
+    async fn on_terminate(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn gc(&self) -> Result<()> {
         Ok(())
     }
 }

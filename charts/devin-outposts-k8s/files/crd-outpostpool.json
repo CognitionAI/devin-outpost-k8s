@@ -70,6 +70,11 @@
                     },
                     "description": "How `resume`-kind sessions are served for this pool.",
                     "properties": {
+                      "gkeStorageConfigName": {
+                        "description": "Name of the `PodSnapshotStorageConfig` (in the pool's namespace) that\nGKE pod snapshots are stored through. Required for the\n[`ResumePolicy::GkeSnapshot`] policy; the storage config (and its GCS\nbucket + Workload Identity IAM) is cluster-admin-provided, see\n<https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots>.",
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "policy": {
                         "default": "StartFresh",
                         "description": "Strategy for serving resume-kind sessions.",
@@ -86,6 +91,16 @@
                         "minimum": 0.0,
                         "nullable": true,
                         "type": "integer"
+                      },
+                      "storageClassName": {
+                        "description": "`StorageClass` for the per-session state volume\n([`ResumePolicy::FilesystemSnapshot`] only). `None` => the cluster\ndefault class.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "volumeSize": {
+                        "description": "Size of the per-session state volume created for the\n[`ResumePolicy::FilesystemSnapshot`] policy (a Kubernetes quantity,\ne.g. `20Gi`). Defaults to [`ResumeConfig::DEFAULT_VOLUME_SIZE`].",
+                        "nullable": true,
+                        "type": "string"
                       }
                     },
                     "type": "object"

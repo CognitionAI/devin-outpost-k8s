@@ -59,10 +59,10 @@ pub struct Metadata {
     pub pool_id: String,
     /// When the session was enqueued (unix seconds).
     #[serde(default)]
-    pub created_at: Option<f64>,
+    pub created_at: Option<i64>,
     /// When this object last changed (unix seconds).
     #[serde(default)]
-    pub updated_at: Option<f64>,
+    pub updated_at: Option<i64>,
 }
 
 /// Desired state of a queued session.
@@ -89,7 +89,7 @@ pub struct Status {
     /// When the current claim expires and the session returns to the queue
     /// (unix seconds).
     #[serde(default)]
-    pub claim_deadline: Option<f64>,
+    pub claim_deadline: Option<i64>,
     /// Coarse status of the underlying Devin session.
     pub session_status: SessionStatus,
     /// Gateway connect token for the claimed session; only returned from a
@@ -114,7 +114,9 @@ pub struct OutpostDevin {
 }
 
 /// A page of [`OutpostDevin`] items plus a resume cursor for the next page /
-/// watch position.
+/// watch position. List and watch cursors are interchangeable
+/// (Kubernetes-style list-then-watch); paging shares the watch's
+/// at-least-once semantics, so boundary duplicates are expected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevinList {
     /// The items in this page.
@@ -123,6 +125,13 @@ pub struct DevinList {
     /// Opaque cursor to resume listing/watching from.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Whether the returned page was full; if true, more rows may be
+    /// available after `cursor`.
+    #[serde(default)]
+    pub has_next_page: bool,
+    /// Total number of matching rows.
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
 /// The kind of change carried by a watch event.
@@ -151,20 +160,65 @@ pub struct WatchEvent {
     pub cursor: Option<String>,
 }
 
-/// Result of a successful claim: everything the worker needs to dial back to the
-/// gateway.
+/// Identifying metadata of an outpost pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaimResponse {
-    /// The (renewed) status, including `connect_token` and `gateway_url`.
-    pub status: Status,
+pub struct PoolMetadata {
+    /// Stable pool identifier.
+    pub pool_id: String,
+    /// Account that owns the pool.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// When the pool was created (unix seconds).
+    #[serde(default)]
+    pub created_at: Option<i64>,
+}
+
+/// Desired state of an outpost pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolSpec {
+    /// Unique (per account) pool name.
+    pub name: String,
+    /// Machine platform; `None` means the default platform.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Observed state of an outpost pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolStatus {
+    /// Number of pending (unclaimed) sessions in the queue.
+    #[serde(default)]
+    pub queue_depth: u64,
+    /// Number of unexpired claims held by workers.
+    #[serde(default)]
+    pub active_claims: u64,
 }
 
 /// An outpost pool (account-scoped queue) as returned by the pools endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pool {
-    /// Stable pool identifier.
-    pub pool_id: String,
-    /// Human-readable name, if set.
+    /// Identifying metadata.
+    pub metadata: PoolMetadata,
+    /// Desired state.
+    pub spec: PoolSpec,
+    /// Observed state.
+    pub status: PoolStatus,
+}
+
+/// A page of the standard cursor-paginated list envelope used by the pools
+/// endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolList {
+    /// The items in this page.
     #[serde(default)]
-    pub name: Option<String>,
+    pub items: Vec<Pool>,
+    /// Cursor for the next page, when `has_next_page` is true.
+    #[serde(default)]
+    pub end_cursor: Option<String>,
+    /// Whether more pages are available after `end_cursor`.
+    #[serde(default)]
+    pub has_next_page: bool,
 }

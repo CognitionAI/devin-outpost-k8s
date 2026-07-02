@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: check
         run: cargo check --all-targets
+      - name: test
+        run: cargo test
       - name: crd is up to date
         run: |
           cargo run --bin crdgen > /tmp/crd.json

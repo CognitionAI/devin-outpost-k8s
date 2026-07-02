@@ -17,17 +17,16 @@
 //! - [`controller`]  — the reconcile loop and per-session `Pod` template builder
 //! - [`snapshot`]    — the cloud-portable snapshot/restore provider abstraction
 //!   used to back `resume` sessions (GKE pod snapshots, filesystem, no-op).
+//! - [`elector`]     — Lease-based leader election
 //! - [`metrics`] / [`telemetry`] — Prometheus metrics and tracing setup.
 //! - [`config`]      — process-level runtime configuration
 //! - [`error`]       — the crate error type
-
-// CR-soon nikhil: Remove once implemented.
-#![allow(dead_code)]
 
 pub mod api;
 pub mod config;
 pub mod controller;
 pub mod crd;
+pub mod elector;
 pub mod error;
 pub mod metrics;
 pub mod snapshot;
