@@ -114,6 +114,17 @@ impl GkeSnapshotProvider {
             .any(|c| c["type"] == "Ready" && c["status"] == "True")
     }
 
+    /// A trigger whose checkpoint failed reports `Triggered: "False"` (e.g.
+    /// reason `Failed`, "context deadline exceeded"). Spent: it never fires
+    /// again.
+    fn trigger_failed(trigger: &DynamicObject) -> bool {
+        trigger.data["status"]["conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["type"] == "Triggered" && c["status"] == "False")
+    }
+
     fn older_than_give_up(obj: &DynamicObject) -> bool {
         obj.creation_timestamp().is_some_and(|created| {
             k8s_openapi::jiff::Timestamp::now().as_second() - created.0.as_second()
@@ -202,12 +213,34 @@ impl SnapshotProvider for GkeSnapshotProvider {
     }
 
     async fn on_suspend(&self, session_id: &str, pod: &Pod) -> Result<SnapshotOutcome> {
+        // A ready snapshot for this session (from this or an earlier pod
+        // incarnation) means the state is already durable. Checking first
+        // keeps retried teardowns and recreated pods from firing spurious
+        // triggers — with `maxSnapshotCountPerGroup: 1`, a new snapshot
+        // attempt would prune the good one.
+        let selector = format!("{LABEL_SESSION_ID}={session_id}");
+        if self
+            .pod_snapshots()
+            .list(&ListParams::default().labels(&selector))
+            .await?
+            .iter()
+            .any(Self::is_ready)
+        {
+            return Ok(SnapshotOutcome::Ready);
+        }
+
+        let pod_running = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .is_some_and(|phase| phase == "Running")
+            && pod.meta().deletion_timestamp.is_none();
         let trigger_name = Self::trigger_name(session_id, pod);
         let triggers = self.triggers();
 
         let trigger = match triggers.get_opt(&trigger_name).await? {
             Some(trigger) => trigger,
-            None => {
+            None if pod_running => {
                 let gvk = GroupVersionKind::gvk(
                     GKE_SNAPSHOT_GROUP,
                     GKE_SNAPSHOT_VERSION,
@@ -223,6 +256,18 @@ impl SnapshotProvider for GkeSnapshotProvider {
                 triggers.create(&PostParams::default(), &trigger).await?;
                 return Ok(SnapshotOutcome::InProgress);
             }
+            None => {
+                // Nothing to checkpoint: the worker already stopped or is
+                // being deleted. Proceeding without a snapshot beats holding
+                // the suspended session's claim hostage; the resume starts
+                // fresh (the brain owns resume semantics regardless).
+                tracing::warn!(
+                    session = session_id,
+                    pod = %pod.name_any(),
+                    "worker pod is not running; suspending without a snapshot"
+                );
+                return Ok(SnapshotOutcome::Ready);
+            }
         };
 
         let snapshot_name = trigger.data["status"]["snapshotCreated"]["name"]
@@ -237,8 +282,8 @@ impl SnapshotProvider for GkeSnapshotProvider {
             && Self::is_ready(snapshot)
         {
             // Label the snapshot with the session so on_terminate can find
-            // and delete it (PodSnapshot resources don't carry the trigger's
-            // labels themselves).
+            // and delete it (the grouping label is only applied by GKE when
+            // grouping is configured).
             let patch = serde_json::json!({
                 "metadata": {"labels": session_labels(&self.pool, session_id)}
             });
@@ -249,6 +294,33 @@ impl SnapshotProvider for GkeSnapshotProvider {
                     &Patch::Merge(&patch),
                 )
                 .await?;
+            return Ok(SnapshotOutcome::Ready);
+        }
+
+        if Self::trigger_failed(&trigger) {
+            if pod_running {
+                // Retry: the failure may have been transient (the trigger
+                // object is spent, so a fresh one is needed).
+                tracing::warn!(
+                    session = session_id,
+                    trigger = %trigger_name,
+                    "snapshot trigger failed; retrying"
+                );
+                match triggers
+                    .delete(&trigger_name, &DeleteParams::default())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(e)) if e.code == 404 => {}
+                    Err(e) => return Err(e.into()),
+                }
+                return Ok(SnapshotOutcome::InProgress);
+            }
+            tracing::warn!(
+                session = session_id,
+                trigger = %trigger_name,
+                "snapshot trigger failed and the worker pod is gone; suspending without a snapshot"
+            );
             return Ok(SnapshotOutcome::Ready);
         }
 
