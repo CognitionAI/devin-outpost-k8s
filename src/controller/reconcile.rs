@@ -20,7 +20,7 @@ use crate::config::OperatorConfig;
 use crate::crd::{Condition, OutpostPool, OutpostPoolStatus};
 use crate::error::Error;
 use crate::metrics::{Metrics, PoolLabels};
-use crate::snapshot::{SnapshotOutcome, SnapshotProvider, provider_for};
+use crate::snapshot::{RestoreVerdict, SnapshotOutcome, SnapshotProvider, provider_for};
 
 use super::context::Context;
 use super::plan::{Action, Observed, next_claim_deadline, plan};
@@ -277,6 +277,31 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
             }
         }
     }
+    // Recycle worker pods that should have been restored from a snapshot but
+    // cold-started (see `GkeSnapshotProvider::verify_restore` for the race
+    // this covers). One retry per snapshot, tracked on the token secret so
+    // the marker survives the pod swap; a second cold start is accepted.
+    for (session_id, worker_pod) in sync.pods_by_session.clone() {
+        let running = worker_pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .is_some_and(|phase| phase == "Running")
+            && worker_pod.metadata.deletion_timestamp.is_none();
+        if !running || sync.provider.verify_restore(&worker_pod) != RestoreVerdict::ColdStarted {
+            continue;
+        }
+        match recycle_cold_started_pod(&mut sync, &session_id).await {
+            Ok(true) => {
+                warn!(session = %session_id, "worker cold-started instead of restoring; recycling pod");
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(session = %session_id, %err, "failed to recycle cold-started worker");
+                first_failure.get_or_insert(err);
+            }
+        }
+    }
     let snapshot_pending = sync.snapshot_pending;
 
     // Cleanup: token secrets whose session no longer exists in the queue.
@@ -425,7 +450,7 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         )
     })?;
 
-    let state_pvc = sync.provider.prepare(session_id).await?;
+    let prepared = sync.provider.prepare(session_id).await?;
 
     let secret = build_session_token_secret(sync.pool, &claimed, connect_token)?;
     sync.secrets
@@ -442,7 +467,8 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         gateway_url,
         token_secret_name: &secret.name_any(),
         default_image: &sync.ctx.config.default_worker_image,
-        state_pvc_name: state_pvc.as_deref(),
+        state_pvc_name: prepared.state_pvc_name.as_deref(),
+        provider_annotations: &prepared.pod_annotations,
     })?;
     match sync.pods.create(&PostParams::default(), &pod).await {
         Ok(created) => {
@@ -453,6 +479,40 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Annotation on the token secret marking that the session's worker was
+/// already recycled once after a cold start (see [`recycle_cold_started_pod`]).
+const ANNOTATION_RESTORE_RETRIED: &str = "outposts.cognition.com/restore-retried";
+
+/// Delete a worker pod that cold-started instead of restoring, so the next
+/// pass recreates it — by which point the node's snapshot agent is up and the
+/// restore succeeds. At most once per session (the marker outlives the pod on
+/// the token secret); returns whether the pod was recycled.
+async fn recycle_cold_started_pod(
+    sync: &mut PoolSync<'_>,
+    session_id: &str,
+) -> crate::Result<bool> {
+    let secret_name = session_token_secret_name(session_id);
+    let Some(secret) = sync.secrets.get_opt(&secret_name).await? else {
+        return Ok(false);
+    };
+    if secret
+        .annotations()
+        .contains_key(ANNOTATION_RESTORE_RETRIED)
+    {
+        return Ok(false);
+    }
+    let patch = serde_json::json!({
+        "metadata": {"annotations": {ANNOTATION_RESTORE_RETRIED: chrono::Utc::now().to_rfc3339()}}
+    });
+    sync.secrets
+        .patch(&secret_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await?;
+    sync.pods_by_session.remove(session_id);
+    sync.snapshot_pending = true;
+    Ok(true)
 }
 
 /// Delete the session's worker pod and token secret.

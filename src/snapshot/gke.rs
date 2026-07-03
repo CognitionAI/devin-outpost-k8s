@@ -9,12 +9,15 @@
 //!
 //! - [`SnapshotProvider::prepare`] applies one `PodSnapshotPolicy` per pool,
 //!   selecting the pool's worker pods, with a `manual` trigger and snapshots
-//!   grouped by the session-ID label (max one snapshot per session).
-//!   Restores need no operator action beyond recreating the pod: GKE matches
-//!   the new pod's distilled spec + snapshot group and restores the latest
-//!   snapshot automatically. Env *values* (like the rotated connect token)
-//!   are not part of the distilled spec, so re-claimed tokens don't break
-//!   matching.
+//!   grouped by the session-ID label (max one snapshot per session). When a
+//!   `Ready` snapshot exists for the session, the recreated pod pins it via
+//!   the `podsnapshot.gke.io/ps-name` annotation; GKE then restores the pod
+//!   on creation (the pod's distilled spec must still match — env *values*
+//!   like the rotated connect token are not part of it, so re-claimed tokens
+//!   don't break matching). Restore is best-effort with a silent cold-start
+//!   fallback, so [`SnapshotProvider::verify_restore`] checks the pod's
+//!   `PodRestored` condition afterwards and the reconciler recycles a
+//!   cold-started pod once.
 //! - [`SnapshotProvider::on_suspend`] creates a `PodSnapshotManualTrigger`
 //!   for the worker pod and reports [`SnapshotOutcome::InProgress`] until the
 //!   resulting `PodSnapshot` goes `Ready` (the pod must stay alive while the
@@ -43,12 +46,18 @@ use crate::controller::{LABEL_MANAGED_BY, LABEL_POOL, LABEL_SESSION_ID, session_
 use crate::crd::OutpostPool;
 use crate::error::{Error, Result};
 
-use super::{SnapshotOutcome, SnapshotProvider};
+use super::{PreparedSession, RestoreVerdict, SnapshotOutcome, SnapshotProvider};
 
 /// API group of the GKE pod-snapshot CRDs.
 const GKE_SNAPSHOT_GROUP: &str = "podsnapshot.gke.io";
 /// API version of the GKE pod-snapshot CRDs.
 const GKE_SNAPSHOT_VERSION: &str = "v1";
+
+/// Pod annotation pinning the exact `PodSnapshot` to restore from.
+const ANNOTATION_PIN_SNAPSHOT: &str = "podsnapshot.gke.io/ps-name";
+/// Pod condition GKE sets on pods it restored (the message carries the
+/// snapshot name).
+const CONDITION_POD_RESTORED: &str = "PodRestored";
 
 /// Abandon a snapshot that has not gone `Ready` after this long and proceed
 /// with pod teardown.
@@ -132,6 +141,21 @@ impl GkeSnapshotProvider {
         })
     }
 
+    /// Most recent `Ready` snapshot labeled with the session, if any.
+    async fn latest_ready_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        let selector = format!("{LABEL_SESSION_ID}={session_id}");
+        let mut ready: Vec<DynamicObject> = self
+            .pod_snapshots()
+            .list(&ListParams::default().labels(&selector))
+            .await?
+            .items
+            .into_iter()
+            .filter(Self::is_ready)
+            .collect();
+        ready.sort_by_key(|s| s.creation_timestamp());
+        Ok(ready.pop().map(|s| s.name_any()))
+    }
+
     async fn delete_labeled(&self, api: &Api<DynamicObject>, session_id: &str) -> Result<()> {
         let selector = format!("{LABEL_SESSION_ID}={session_id}");
         for obj in api.list(&ListParams::default().labels(&selector)).await? {
@@ -151,9 +175,14 @@ impl SnapshotProvider for GkeSnapshotProvider {
         "gke-pod-snapshot"
     }
 
-    /// Apply the pool's `PodSnapshotPolicy`. No per-session state volume is
-    /// needed — the checkpoint carries the filesystem.
-    async fn prepare(&self, _session_id: &str) -> Result<Option<String>> {
+    /// Apply the pool's `PodSnapshotPolicy` and, when the session already has
+    /// a `Ready` snapshot, pin it onto the pod via the
+    /// `podsnapshot.gke.io/ps-name` annotation. Pinning (rather than relying
+    /// on latest-in-group matching) makes the expected restore explicit so
+    /// [`Self::verify_restore`] can tell a cold start from success. No
+    /// per-session state volume is needed — the checkpoint carries the
+    /// filesystem.
+    async fn prepare(&self, session_id: &str) -> Result<PreparedSession> {
         let storage_config = self
             .pool
             .spec
@@ -209,7 +238,42 @@ impl SnapshotProvider for GkeSnapshotProvider {
                 &Patch::Apply(&policy),
             )
             .await?;
-        Ok(None)
+
+        let mut prepared = PreparedSession::default();
+        if let Some(snapshot) = self.latest_ready_snapshot(session_id).await? {
+            prepared
+                .pod_annotations
+                .insert(ANNOTATION_PIN_SNAPSHOT.to_string(), snapshot);
+        }
+        Ok(prepared)
+    }
+
+    /// The pod-snapshot agent is a DaemonSet that races workload pods onto
+    /// freshly scaled-up nodes; a pod that starts before the agent silently
+    /// cold-starts (no restore is attempted, and the platform offers no
+    /// barrier — Google's own agent-sandbox client verifies restores the
+    /// same way). The reconciler recycles such pods once; by then the node's
+    /// agent is up and the retry restores.
+    fn verify_restore(&self, pod: &Pod) -> RestoreVerdict {
+        let Some(pinned) = pod.annotations().get(ANNOTATION_PIN_SNAPSHOT) else {
+            return RestoreVerdict::NotApplicable;
+        };
+        let restored = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .into_iter()
+            .flatten()
+            .any(|c| {
+                c.type_ == CONDITION_POD_RESTORED
+                    && c.status == "True"
+                    && c.message.as_deref().is_some_and(|m| m.contains(pinned))
+            });
+        if restored {
+            RestoreVerdict::Restored
+        } else {
+            RestoreVerdict::ColdStarted
+        }
     }
 
     async fn on_suspend(&self, session_id: &str, pod: &Pod) -> Result<SnapshotOutcome> {
@@ -218,14 +282,7 @@ impl SnapshotProvider for GkeSnapshotProvider {
         // keeps retried teardowns and recreated pods from firing spurious
         // triggers — with `maxSnapshotCountPerGroup: 1`, a new snapshot
         // attempt would prune the good one.
-        let selector = format!("{LABEL_SESSION_ID}={session_id}");
-        if self
-            .pod_snapshots()
-            .list(&ListParams::default().labels(&selector))
-            .await?
-            .iter()
-            .any(Self::is_ready)
-        {
+        if self.latest_ready_snapshot(session_id).await?.is_some() {
             return Ok(SnapshotOutcome::Ready);
         }
 
@@ -348,5 +405,109 @@ impl SnapshotProvider for GkeSnapshotProvider {
     /// set in [`Self::prepare`] from `resume.snapshotTtlSeconds`).
     async fn gc(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    use crate::crd::{OutpostPoolSpec, SecretKeyRef};
+
+    use super::*;
+
+    fn provider() -> GkeSnapshotProvider {
+        // The kube client is never dialed by the pure methods under test,
+        // but constructing it initializes rustls.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new("http://localhost:1".parse().unwrap());
+        let pool = OutpostPool::new(
+            "p",
+            OutpostPoolSpec {
+                pool_id: "pool_x".to_string(),
+                token_secret_ref: SecretKeyRef {
+                    name: "t".to_string(),
+                    key: "token".to_string(),
+                },
+                api_url: None,
+                max_concurrent_sessions: 1,
+                worker: crate::crd::WorkerTemplate {
+                    template: Default::default(),
+                    container_name: "devin-worker".to_string(),
+                    overrides: Default::default(),
+                },
+                resume: Default::default(),
+            },
+        );
+        GkeSnapshotProvider::new(
+            kube::Client::try_from(config).unwrap(),
+            std::sync::Arc::new(pool),
+        )
+    }
+
+    fn pod(pin: Option<&str>, condition: Option<(&str, &str, &str)>) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                annotations: pin.map(|p| {
+                    std::collections::BTreeMap::from([(
+                        ANNOTATION_PIN_SNAPSHOT.to_string(),
+                        p.to_string(),
+                    )])
+                }),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                conditions: condition.map(|(type_, status, message)| {
+                    vec![PodCondition {
+                        type_: type_.to_string(),
+                        status: status.to_string(),
+                        message: Some(message.to_string()),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // tokio: constructing the (never-dialed) kube client spawns its buffer task.
+    #[tokio::test]
+    async fn verify_restore_judges_the_pod_restored_condition() {
+        let provider = provider();
+        // Unpinned pods expect no restore.
+        assert_eq!(
+            provider.verify_restore(&pod(None, None)),
+            RestoreVerdict::NotApplicable
+        );
+        // Pinned + PodRestored=True naming the snapshot => restored.
+        assert_eq!(
+            provider.verify_restore(&pod(
+                Some("snap-1"),
+                Some((CONDITION_POD_RESTORED, "True", "restored from snap-1"))
+            )),
+            RestoreVerdict::Restored
+        );
+        // Pinned but no condition, a failed restore, or the wrong snapshot
+        // => cold start.
+        assert_eq!(
+            provider.verify_restore(&pod(Some("snap-1"), None)),
+            RestoreVerdict::ColdStarted
+        );
+        assert_eq!(
+            provider.verify_restore(&pod(
+                Some("snap-1"),
+                Some((CONDITION_POD_RESTORED, "False", ""))
+            )),
+            RestoreVerdict::ColdStarted
+        );
+        assert_eq!(
+            provider.verify_restore(&pod(
+                Some("snap-1"),
+                Some((CONDITION_POD_RESTORED, "True", "restored from snap-2"))
+            )),
+            RestoreVerdict::ColdStarted
+        );
     }
 }

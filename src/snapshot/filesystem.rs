@@ -20,7 +20,7 @@ use crate::controller::{
 use crate::crd::OutpostPool;
 use crate::error::Result;
 
-use super::{SnapshotOutcome, SnapshotProvider};
+use super::{PreparedSession, SnapshotOutcome, SnapshotProvider};
 
 /// Snapshot provider backed by retained per-session `PersistentVolumeClaim`s.
 #[derive(Clone)]
@@ -54,7 +54,7 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
     ///
     /// An existing PVC is reused as-is — its spec is immutable, and changed
     /// pool volume settings only affect volumes created afterwards.
-    async fn prepare(&self, session_id: &str) -> Result<Option<String>> {
+    async fn prepare(&self, session_id: &str) -> Result<PreparedSession> {
         let name = state_pvc_name(session_id);
         match self.pvcs().get_opt(&name).await? {
             Some(existing) => {
@@ -76,7 +76,10 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
                 }
             }
         }
-        Ok(Some(name))
+        Ok(PreparedSession {
+            state_pvc_name: Some(name),
+            ..Default::default()
+        })
     }
 
     /// Data is already durable on the PVC; just timestamp it for TTL GC.

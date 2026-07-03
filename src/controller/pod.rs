@@ -181,6 +181,10 @@ pub struct WorkerPodParams<'a> {
     /// [`WORKER_DATA_DIR`], when the pool's resume policy keeps one (see
     /// [`build_state_pvc`]).
     pub state_pvc_name: Option<&'a str>,
+    /// Annotations required by the pool's snapshot provider (e.g. the GKE
+    /// restore pin). Applied after overrides: like the pod name and owner
+    /// reference, they are never overridable.
+    pub provider_annotations: &'a BTreeMap<String, String>,
 }
 
 /// Build the per-session `Secret` holding the gateway connect token under
@@ -275,6 +279,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         token_secret_name,
         default_image,
         state_pvc_name,
+        provider_annotations,
     } = params;
     let session_id = &session.metadata.session_id;
     let worker = &pool.spec.worker;
@@ -393,6 +398,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     labels.extend(operator_labels);
     let mut annotations = template_meta.annotations.unwrap_or_default();
     annotations.extend(operator_annotations);
+    annotations.extend(provider_annotations.clone());
 
     Ok(Pod {
         metadata: ObjectMeta {
@@ -484,6 +490,7 @@ mod tests {
     }
 
     fn params<'a>(pool: &'a OutpostPool, session: &'a OutpostDevin) -> WorkerPodParams<'a> {
+        static NO_ANNOTATIONS: BTreeMap<String, String> = BTreeMap::new();
         WorkerPodParams {
             pool,
             session,
@@ -491,6 +498,7 @@ mod tests {
             token_secret_name: "outpost-token-x",
             default_image: "img:default",
             state_pvc_name: None,
+            provider_annotations: &NO_ANNOTATIONS,
         }
     }
 
@@ -654,6 +662,24 @@ mod tests {
         assert_eq!(
             cache_dir.value.as_deref(),
             Some(format!("{WORKER_DATA_DIR}/cache").as_str())
+        );
+    }
+
+    #[test]
+    fn provider_annotations_survive_override_replacement() {
+        let mut pool = pool();
+        pool.spec.worker.overrides.annotations = Some(BTreeMap::new());
+        let session = session("devin-1");
+        let mut p = params(&pool, &session);
+        let pin = BTreeMap::from([(
+            "podsnapshot.gke.io/ps-name".to_string(),
+            "snap-uuid".to_string(),
+        )]);
+        p.provider_annotations = &pin;
+        let pod = build_worker_pod(p).unwrap();
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap()["podsnapshot.gke.io/ps-name"],
+            "snap-uuid"
         );
     }
 

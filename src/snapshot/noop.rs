@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-use super::{SnapshotOutcome, SnapshotProvider};
+use super::{PreparedSession, SnapshotOutcome, SnapshotProvider};
 
 /// Does nothing: resumes always start fresh. Fully portable. The session
 /// still resumes (the cloud brain owns resume semantics); only the worker's
@@ -18,8 +18,8 @@ impl SnapshotProvider for NoopSnapshotProvider {
         "noop"
     }
 
-    async fn prepare(&self, _session_id: &str) -> Result<Option<String>> {
-        Ok(None)
+    async fn prepare(&self, _session_id: &str) -> Result<PreparedSession> {
+        Ok(PreparedSession::default())
     }
 
     async fn on_suspend(

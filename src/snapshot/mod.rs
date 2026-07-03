@@ -43,6 +43,30 @@ pub enum SnapshotOutcome {
     InProgress,
 }
 
+/// Per-session state a provider sets up before the worker pod is created
+/// (see [`SnapshotProvider::prepare`]).
+#[derive(Debug, Clone, Default)]
+pub struct PreparedSession {
+    /// Name of a `PersistentVolumeClaim` the pod must mount at
+    /// [`crate::controller::WORKER_DATA_DIR`].
+    pub state_pvc_name: Option<String>,
+    /// Annotations to add to the worker pod (e.g. pinning the snapshot to
+    /// restore from).
+    pub pod_annotations: std::collections::BTreeMap<String, String>,
+}
+
+/// Whether a started worker pod came back from a snapshot (see
+/// [`SnapshotProvider::verify_restore`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreVerdict {
+    /// No restore was expected for this pod.
+    NotApplicable,
+    /// The pod was restored from the expected snapshot.
+    Restored,
+    /// A restore was expected but the pod started fresh.
+    ColdStarted,
+}
+
 /// Abstraction over a cloud/cluster's snapshot mechanism.
 ///
 /// Implementors persist and restore the state of a worker pod so a `resume`
@@ -52,10 +76,15 @@ pub trait SnapshotProvider: Send + Sync {
     /// Human-readable provider name (for logs/metrics).
     fn name(&self) -> &'static str;
 
-    /// Set up per-session state before the worker pod is created. Returns the
-    /// name of a `PersistentVolumeClaim` the pod must mount at
-    /// [`crate::controller::WORKER_DATA_DIR`], if the policy keeps one.
-    async fn prepare(&self, session_id: &str) -> Result<Option<String>>;
+    /// Set up per-session state before the worker pod is created: a state
+    /// volume, a snapshot policy + restore pin, or nothing.
+    async fn prepare(&self, session_id: &str) -> Result<PreparedSession>;
+
+    /// Judge whether a started worker pod came back from its expected
+    /// snapshot. Pure inspection of the pod object; must not perform I/O.
+    fn verify_restore(&self, _pod: &k8s_openapi::api::core::v1::Pod) -> RestoreVerdict {
+        RestoreVerdict::NotApplicable
+    }
 
     /// Take (or continue taking) a snapshot of the worker for `session_id`.
     /// Invoked on every reconcile while the session is suspended and its pod
