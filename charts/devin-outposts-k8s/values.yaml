@@ -60,10 +60,12 @@ operator:
   logFormat: text   # text | json
   logLevel: info
 
-# -- Custom Resource Definition handling.
-crds:
-  # -- Install the OutpostPool CRD with this chart.
-  install: true
+# The OutpostPool CRD ships in the chart's crds/ directory so it is installed
+# before the templates are validated (a fresh install can therefore include a
+# defaultPool). Helm never upgrades crds/: apply the new CRD manually when
+# upgrading the operator:
+#   kubectl apply -f charts/devin-outposts-k8s/crds/outpostpool.yaml
+# Use `helm install --skip-crds` to opt out of installing it.
 
 metrics:
   # -- Expose the Prometheus /metrics endpoint via a Service.

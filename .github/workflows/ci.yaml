@@ -28,7 +28,7 @@ jobs:
       - name: crd is up to date
         run: |
           cargo run --bin crdgen > /tmp/crd.json
-          diff -u charts/devin-outposts-k8s/files/crd-outpostpool.json /tmp/crd.json
+          diff -u charts/devin-outposts-k8s/crds/outpostpool.yaml /tmp/crd.json
 
   helm:
     runs-on: ubuntu-latest

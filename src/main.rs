@@ -13,6 +13,13 @@ use devin_outposts_k8s::{controller, elector, telemetry};
 async fn main() -> anyhow::Result<()> {
     telemetry::init();
 
+    // Both `ring` (via kube) and `aws-lc-rs` (via reqwest) are in the
+    // dependency graph, so rustls cannot pick a process-level crypto
+    // provider on its own.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other crypto provider is installed before this");
+
     let config = Arc::new(OperatorConfig::from_env()?);
     tracing::info!(?config, "starting devin-outposts-k8s");
 

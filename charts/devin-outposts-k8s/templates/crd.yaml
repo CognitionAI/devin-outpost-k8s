@@ -1,6 +1,0 @@
-{{- if .Values.crds.install -}}
-# Generated from the Rust types via `cargo run --bin crdgen`.
-# JSON is valid YAML; kept as a single document so Helm manages the CRD lifecycle
-# (unlike the special `crds/` directory, which is install-only and untoggleable).
-{{ .Files.Get "files/crd-outpostpool.json" }}
-{{- end }}
