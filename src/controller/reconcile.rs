@@ -293,6 +293,14 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         let name = secret.name_any();
         if !expected_secrets.contains(&name) {
             delete_ignoring_missing(&secrets, &name).await?;
+            // A session can leave the queue (tombstoned) without ever being
+            // observed as terminated — e.g. suspended sessions the sweeper
+            // reaps — so the terminate-time snapshot cleanup runs here too.
+            if let Some(session_id) = secret.labels().get(super::LABEL_SESSION_ID)
+                && let Err(err) = provider.on_terminate(session_id).await
+            {
+                warn!(session = %session_id, %err, "snapshot cleanup for vanished session failed");
+            }
         }
     }
 
