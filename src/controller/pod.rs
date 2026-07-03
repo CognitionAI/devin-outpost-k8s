@@ -49,10 +49,9 @@ use crate::error::{Error, Result};
 
 /// Default worker image used when a pool's `worker.overrides.image` is unset.
 ///
-/// CR-soon nikhil: "there's probably a better tag to use later"; the operator
-/// deployment should eventually pin this (via config) to the image matching its
-/// own release.
-pub const DEFAULT_WORKER_IMAGE: &str = "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016";
+/// CR-soon nikhil: the operator deployment should eventually pin this (via
+/// config) to the image matching its own release.
+pub const DEFAULT_WORKER_IMAGE: &str = "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.18";
 
 /// Entrypoint the operator sets on the worker container. Kept separate from
 /// the args so `worker.overrides.args` can tweak flags without repeating the

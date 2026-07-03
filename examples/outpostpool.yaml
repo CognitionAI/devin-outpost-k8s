@@ -77,7 +77,7 @@ spec:
     # overrides:
     #   # Pin the worker image. When unset, the operator's configured default
     #   # worker image (pinned to its release) is used.
-    #   image: public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016
+    #   image: public.ecr.aws/e0h8a4b6/devin-cli:3000.1.18
     #
     #   # Swap the worker entrypoint / args (default: devin worker start --session <id>).
     #   command: ["/usr/local/bin/devin"]

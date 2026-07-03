@@ -56,8 +56,7 @@ operator:
   # persists it in a ConfigMap.
   acceptorId: ""
   # -- Default worker image when a pool does not pin one (worker.overrides.image).
-  # CR-soon nikhil: "there's probably a better tag to use later".
-  defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.1016"
+  defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:3000.1.18"
   logFormat: text   # text | json
   logLevel: info
 
