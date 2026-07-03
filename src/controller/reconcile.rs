@@ -291,7 +291,7 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         if !running || sync.provider.verify_restore(&worker_pod) != RestoreVerdict::ColdStarted {
             continue;
         }
-        match recycle_cold_started_pod(&mut sync, &session_id).await {
+        match recycle_unrestored_pod(&mut sync, &session_id, false).await {
             Ok(true) => {
                 warn!(session = %session_id, "worker cold-started instead of restoring; recycling pod");
             }
@@ -414,6 +414,22 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
             session_id,
             restarts,
         } => {
+            // A worker crash-looping on a snapshot pin (e.g. `OCI runtime
+            // restore failed` from a CPU-feature mismatch) gets one unpinned
+            // retry before the session is given back.
+            if sync
+                .pods_by_session
+                .get(session_id)
+                .is_some_and(|pod| sync.provider.verify_restore(pod) == RestoreVerdict::ColdStarted)
+                && recycle_unrestored_pod(sync, session_id, true).await?
+            {
+                warn!(
+                    session = %session_id,
+                    restarts,
+                    "worker failing under a snapshot pin; retrying without it"
+                );
+                return Ok(());
+            }
             warn!(
                 session = %session_id,
                 restarts,
@@ -450,7 +466,17 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         )
     })?;
 
-    let prepared = sync.provider.prepare(session_id).await?;
+    let mut prepared = sync.provider.prepare(session_id).await?;
+    // See `recycle_unrestored_pod`: a crashed restore's replacement starts
+    // without the provider's restore annotations so it deliberately
+    // cold-starts instead of looping.
+    let secret_name = session_token_secret_name(session_id);
+    if let Some(existing) = sync.secrets.get_opt(&secret_name).await?
+        && existing.annotations().get(ANNOTATION_RESTORE_RETRIED)
+            == Some(&RETRY_WITHOUT_PIN.to_string())
+    {
+        prepared.pod_annotations.clear();
+    }
 
     let secret = build_session_token_secret(sync.pool, &claimed, connect_token)?;
     sync.secrets
@@ -482,16 +508,32 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
 }
 
 /// Annotation on the token secret marking that the session's worker was
-/// already recycled once after a cold start (see [`recycle_cold_started_pod`]).
+/// already recycled once this claim cycle (see [`recycle_unrestored_pod`]).
+/// The value records the retry flavor; [`RETRY_WITHOUT_PIN`] additionally
+/// makes the replacement start without the provider's restore annotations.
 const ANNOTATION_RESTORE_RETRIED: &str = "outposts.cognition.com/restore-retried";
+/// Marker value for the restore-failure flavor of the retry.
+const RETRY_WITHOUT_PIN: &str = "without-pin";
+/// Marker value for the agent-race flavor of the retry (the replacement
+/// keeps its pin and is expected to restore on the now-warm node).
+const RETRY_WITH_PIN: &str = "with-pin";
 
-/// Delete a worker pod that cold-started instead of restoring, so the next
-/// pass recreates it — by which point the node's snapshot agent is up and the
-/// restore succeeds. At most once per session (the marker outlives the pod on
-/// the token secret); returns whether the pod was recycled.
-async fn recycle_cold_started_pod(
+/// Delete a worker pod whose expected restore did not happen, so the next
+/// pass recreates it. Two flavors:
+///
+/// - `drop_pin = false` — the pod *ran* without restoring (the node's
+///   snapshot agent lost the scale-up race): the replacement keeps its pin,
+///   and by the time it starts the agent is up, so it restores.
+/// - `drop_pin = true` — the pod *crashed* on its pin (e.g. a CPU-feature
+///   mismatch): the replacement starts unpinned and deliberately cold.
+///
+/// At most one recycle per claim cycle (the marker outlives the pod on the
+/// token secret, which is deleted on suspend/terminate); returns whether the
+/// pod was recycled.
+async fn recycle_unrestored_pod(
     sync: &mut PoolSync<'_>,
     session_id: &str,
+    drop_pin: bool,
 ) -> crate::Result<bool> {
     let secret_name = session_token_secret_name(session_id);
     let Some(secret) = sync.secrets.get_opt(&secret_name).await? else {
@@ -503,8 +545,13 @@ async fn recycle_cold_started_pod(
     {
         return Ok(false);
     }
+    let value = if drop_pin {
+        RETRY_WITHOUT_PIN
+    } else {
+        RETRY_WITH_PIN
+    };
     let patch = serde_json::json!({
-        "metadata": {"annotations": {ANNOTATION_RESTORE_RETRIED: chrono::Utc::now().to_rfc3339()}}
+        "metadata": {"annotations": {ANNOTATION_RESTORE_RETRIED: value}}
     });
     sync.secrets
         .patch(&secret_name, &PatchParams::default(), &Patch::Merge(&patch))

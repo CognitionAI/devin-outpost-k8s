@@ -114,13 +114,16 @@ impl GkeSnapshotProvider {
         format!("{}-{uid_suffix}", base.trim_end_matches('-'))
     }
 
-    /// Ready = the object has a `Ready` condition with status `"True"`.
+    /// Ready = the object has a `Ready` condition with status `"True"` and
+    /// is not being deleted (a `Deleting` snapshot keeps its Ready condition
+    /// while its finalizer clears the GCS files).
     fn is_ready(obj: &DynamicObject) -> bool {
-        obj.data["status"]["conditions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|c| c["type"] == "Ready" && c["status"] == "True")
+        obj.metadata.deletion_timestamp.is_none()
+            && obj.data["status"]["conditions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["type"] == "Ready" && c["status"] == "True")
     }
 
     /// A trigger whose checkpoint failed reports `Triggered: "False"` (e.g.
