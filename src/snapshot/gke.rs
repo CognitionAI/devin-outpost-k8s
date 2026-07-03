@@ -143,6 +143,16 @@ impl GkeSnapshotProvider {
 
     /// Most recent `Ready` snapshot labeled with the session, if any.
     async fn latest_ready_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        self.latest_ready_snapshot_since(session_id, None).await
+    }
+
+    /// Like [`Self::latest_ready_snapshot`], but only snapshots created at or
+    /// after `since`.
+    async fn latest_ready_snapshot_since(
+        &self,
+        session_id: &str,
+        since: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
+    ) -> Result<Option<String>> {
         let selector = format!("{LABEL_SESSION_ID}={session_id}");
         let mut ready: Vec<DynamicObject> = self
             .pod_snapshots()
@@ -151,6 +161,11 @@ impl GkeSnapshotProvider {
             .items
             .into_iter()
             .filter(Self::is_ready)
+            .filter(|s| match (since, s.creation_timestamp()) {
+                (Some(since), Some(created)) => created >= *since,
+                (Some(_), None) => false,
+                (None, _) => true,
+            })
             .collect();
         ready.sort_by_key(|s| s.creation_timestamp());
         Ok(ready.pop().map(|s| s.name_any()))
@@ -277,12 +292,18 @@ impl SnapshotProvider for GkeSnapshotProvider {
     }
 
     async fn on_suspend(&self, session_id: &str, pod: &Pod) -> Result<SnapshotOutcome> {
-        // A ready snapshot for this session (from this or an earlier pod
-        // incarnation) means the state is already durable. Checking first
-        // keeps retried teardowns and recreated pods from firing spurious
-        // triggers — with `maxSnapshotCountPerGroup: 1`, a new snapshot
-        // attempt would prune the good one.
-        if self.latest_ready_snapshot(session_id).await?.is_some() {
+        // A ready snapshot taken during *this* suspend cycle means the state
+        // is already durable. Checking first keeps retried teardowns from
+        // firing spurious triggers — with `maxSnapshotCountPerGroup: 1`, a
+        // new snapshot attempt would prune the good one. Snapshots that
+        // predate the pod are from an earlier cycle (the state this pod was
+        // restored from) and must not satisfy a new suspend.
+        let pod_created = pod.creation_timestamp();
+        if self
+            .latest_ready_snapshot_since(session_id, pod_created.as_ref())
+            .await?
+            .is_some()
+        {
             return Ok(SnapshotOutcome::Ready);
         }
 
