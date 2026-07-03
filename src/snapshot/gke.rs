@@ -225,7 +225,7 @@ impl SnapshotProvider for GkeSnapshotProvider {
             }
         };
 
-        let snapshot_name = trigger.data["status"]["snapshotName"]
+        let snapshot_name = trigger.data["status"]["snapshotCreated"]["name"]
             .as_str()
             .map(str::to_string);
         let snapshot = match &snapshot_name {
