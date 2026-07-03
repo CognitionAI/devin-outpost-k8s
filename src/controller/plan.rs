@@ -145,15 +145,20 @@ pub fn plan(observed: &Observed<'_>) -> Vec<Action> {
     }
 
     // Claim pending sessions, oldest first, up to the concurrency limit.
-    // Only rows whose session awaits serving: a released suspended/terminated
-    // session leaves a phase=pending row behind until the upstream sweeper
-    // tombstones it, and re-claiming one would flap suspend→release→claim
-    // forever.
+    // A row can be pending with a *running* session (the brain enqueues the
+    // row at session start, before any worker claims it), but terminal
+    // states are excluded: a released suspended/terminated session leaves a
+    // phase=pending row behind until the upstream sweeper tombstones it, and
+    // re-claiming one would flap suspend→release→claim forever.
     let mut pending: Vec<&OutpostDevin> = observed
         .sessions
         .iter()
         .filter(|s| {
-            s.status.phase == Phase::Pending && s.status.session_status == SessionStatus::Pending
+            s.status.phase == Phase::Pending
+                && !matches!(
+                    s.status.session_status,
+                    SessionStatus::Terminated | SessionStatus::Suspended
+                )
         })
         .collect();
     pending.sort_by(|a, b| {
@@ -400,10 +405,17 @@ mod tests {
         let sessions = vec![
             session("dead", 1, Phase::Pending, SessionStatus::Terminated),
             session("asleep", 2, Phase::Pending, SessionStatus::Suspended),
+            // The brain enqueues at session start, so an unclaimed fresh
+            // row's session can already be running.
             session("live", 3, Phase::Pending, SessionStatus::Running),
         ];
         let pods = BTreeMap::new();
-        assert_eq!(plan(&observed(&sessions, &pods, &[])), vec![]);
+        assert_eq!(
+            plan(&observed(&sessions, &pods, &[])),
+            vec![Action::Claim {
+                session_id: "live".into()
+            }]
+        );
     }
 
     #[test]
