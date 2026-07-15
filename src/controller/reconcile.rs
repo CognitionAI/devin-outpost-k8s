@@ -146,11 +146,15 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
     ctx.metrics.reconciliations.get_or_create(&labels).inc();
 
     let ns = pool.namespace().unwrap_or_else(|| "default".to_string());
-    let api_url = pool
-        .spec
-        .api_url
-        .clone()
-        .unwrap_or_else(|| ctx.config.default_api_url.clone());
+    // Resolved before the token secret is read: an untrusted URL must not even
+    // cause a secret read, let alone receive the value.
+    let api_url = match ctx.config.resolve_api_url(pool.spec.api_url.as_deref()) {
+        Ok(api_url) => api_url,
+        Err(err) => {
+            update_status(&pool, ctx, degraded_status(&pool, ctx, &err), &ns).await?;
+            return Err(err);
+        }
+    };
 
     let token = match pool_token(&pool, ctx, &ns).await {
         Ok(token) => token,
@@ -653,13 +657,17 @@ async fn cleanup(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<Requeue
     let ns = pool.namespace().unwrap_or_else(|| "default".to_string());
     ctx.watchers.remove(&pool.uid().unwrap_or_default());
 
-    match pool_token(&pool, ctx, &ns).await {
-        Ok(token) => {
-            let api_url = pool
-                .spec
-                .api_url
-                .clone()
-                .unwrap_or_else(|| ctx.config.default_api_url.clone());
+    // As in `apply`: the URL is resolved before the token secret is read, so an
+    // untrusted URL neither triggers a secret read nor receives a request.
+    let client = match ctx.config.resolve_api_url(pool.spec.api_url.as_deref()) {
+        Ok(api_url) => pool_token(&pool, ctx, &ns)
+            .await
+            .map(|token| (api_url, token)),
+        Err(err) => Err(err),
+    };
+
+    match client {
+        Ok((api_url, token)) => {
             let acceptor_id = ctx.acceptor_id().await?.to_string();
             let outposts = OutpostsClient::new(&api_url, &token, &acceptor_id)?;
             let ours = outposts
@@ -691,8 +699,9 @@ async fn cleanup(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<Requeue
             }
         }
         Err(err) => {
-            // The token secret may already be gone; deletion must not wedge.
-            warn!(pool = %pool.spec.pool_id, %err, "no pool token during deletion; claims will expire on their own");
+            // The pool may name an untrusted URL, or its token secret may
+            // already be gone; deletion must not wedge on either.
+            warn!(pool = %pool.spec.pool_id, %err, "no usable upstream client during deletion; claims will expire on their own");
         }
     }
 

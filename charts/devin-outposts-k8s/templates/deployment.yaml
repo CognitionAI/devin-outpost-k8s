@@ -48,6 +48,8 @@ spec:
               value: {{ .Values.operator.watchNamespace | quote }}
             - name: DEVIN_API_URL
               value: {{ .Values.operator.defaultApiUrl | quote }}
+            - name: DEVIN_API_URL_ALLOWLIST
+              value: {{ join "," .Values.operator.apiUrlAllowlist | quote }}
             - name: DEVIN_WORKER_IMAGE
               value: {{ .Values.operator.defaultWorkerImage | quote }}
             - name: ACCEPTOR_ID

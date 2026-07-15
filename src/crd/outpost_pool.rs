@@ -37,7 +37,11 @@ pub struct OutpostPoolSpec {
     pub token_secret_ref: SecretKeyRef,
 
     /// Override for the upstream API base URL. Defaults to the operator's
-    /// configured default when unset.
+    /// configured default when unset. Must be one of the URLs the operator
+    /// trusts (its default, plus `DEVIN_API_URL_ALLOWLIST`); any other value is
+    /// rejected, because this pool's token `Secret` is sent to this URL as a
+    /// bearer credential. See
+    /// [`crate::config::OperatorConfig::api_url_allowlist`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
 

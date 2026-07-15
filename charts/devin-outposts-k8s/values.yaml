@@ -51,6 +51,11 @@ operator:
   watchNamespace: ""
   # -- Default upstream Outposts API base URL when a pool does not override it.
   defaultApiUrl: "https://api.devin.ai"
+  # -- Additional API base URLs a pool may select with `spec.apiUrl`. Any other
+  # override is rejected (the pool's token Secret is sent to that URL as a
+  # bearer credential, so anyone able to create an OutpostPool could otherwise
+  # make the operator ship namespace Secrets to a host of their choosing).
+  apiUrlAllowlist: []
   # -- Identity used when claiming sessions upstream; must be unique within the
   # account and stable for this install. Empty => the operator generates one and
   # persists it in a ConfigMap.

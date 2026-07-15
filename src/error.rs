@@ -39,6 +39,14 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// A pool's `spec.apiUrl` names a URL the operator does not trust. See
+    /// [`crate::config::OperatorConfig::api_url_allowlist`].
+    #[error("api url {url:?} is not the operator default and is not in the allowlist")]
+    ApiUrlNotAllowed {
+        /// The rejected URL.
+        url: String,
+    },
+
     /// A referenced Kubernetes `Secret` (e.g. the pool PAT) was missing a key.
     #[error("secret {name:?} missing key {key:?}")]
     MissingSecretKey {

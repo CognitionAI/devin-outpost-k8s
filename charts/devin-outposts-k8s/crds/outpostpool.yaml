@@ -49,7 +49,7 @@
                 "description": "`OutpostPool` binds one account-scoped Devin Outposts queue (identified by\n`poolId` + an account PAT) to a worker `Pod` template. The operator watches\nthe queue for this pool, claims pending sessions, and runs the `devin` worker\nfor each claimed session using the settings below.\n\nOne operator deployment reconciles many `OutpostPool` resources.",
                 "properties": {
                   "apiUrl": {
-                    "description": "Override for the upstream API base URL. Defaults to the operator's\nconfigured default when unset.",
+                    "description": "Override for the upstream API base URL. Defaults to the operator's\nconfigured default when unset. Must be one of the URLs the operator\ntrusts (its default, plus `DEVIN_API_URL_ALLOWLIST`); any other value is\nrejected, because this pool's token `Secret` is sent to this URL as a\nbearer credential. See\n[`crate::config::OperatorConfig::api_url_allowlist`].",
                     "nullable": true,
                     "type": "string"
                   },
