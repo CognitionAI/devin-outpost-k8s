@@ -233,6 +233,14 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         max_concurrent: pool.spec.max_concurrent_sessions,
         restart_limit: ctx.config.worker_restart_limit,
         renew_margin_secs: ctx.config.claim_renew_margin.as_secs() as i64,
+        container_name: &pool.spec.worker.container_name,
+        desired_image: pool
+            .spec
+            .worker
+            .overrides
+            .image
+            .as_deref()
+            .unwrap_or(&ctx.config.default_worker_image),
         now,
     });
 
@@ -447,6 +455,15 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
         Action::ReplaceSucceededPod { session_id } => {
             delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await
         }
+        Action::ReplaceDriftedPod { session_id } => {
+            info!(
+                session = %session_id,
+                "crash-looping worker's image is stale; recreating with the current spec"
+            );
+            delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await?;
+            sync.pods_by_session.remove(session_id);
+            Ok(())
+        }
         Action::DeleteOrphanPod { pod_name } => delete_ignoring_missing(&sync.pods, pod_name).await,
     }
 }
@@ -628,12 +645,65 @@ fn degraded_status(pool: &OutpostPool, ctx: &Context, err: &Error) -> OutpostPoo
     }
 }
 
+/// Prepare the status to patch, or `None` when patching would be pure churn.
+///
+/// Every status patch fires the controller's own pool watch and immediately
+/// re-triggers reconcile, so unconditional writes self-trigger in a loop —
+/// on a persistently failing pool (e.g. a bad token) that loop is hot,
+/// hammering both the cluster and the upstream API instead of honoring
+/// [`error_policy`]'s backoff. Two measures keep the patch a no-op unless
+/// something meaningful changed:
+///
+/// - a condition equal to the current one (up to its timestamp) keeps its
+///   previous `lastTransitionTime`;
+/// - when only `lastSynced` moved, it is refreshed only after it has gone
+///   at least `min_last_synced_refresh` stale.
+fn prepare_status_patch(
+    old: Option<&OutpostPoolStatus>,
+    mut status: OutpostPoolStatus,
+    min_last_synced_refresh: Duration,
+) -> Option<OutpostPoolStatus> {
+    let Some(old) = old else { return Some(status) };
+    for condition in &mut status.conditions {
+        if let Some(previous) = old.conditions.iter().find(|c| {
+            c.type_ == condition.type_
+                && c.status == condition.status
+                && c.reason == condition.reason
+                && c.message == condition.message
+        }) {
+            condition.last_transition_time = previous.last_transition_time.clone();
+        }
+    }
+    let mut comparable = status.clone();
+    comparable.last_synced = old.last_synced.clone();
+    if &comparable != old {
+        return Some(status);
+    }
+    if status.last_synced == old.last_synced {
+        return None;
+    }
+    let stale = old
+        .last_synced
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_none_or(|t| {
+            chrono::Utc::now() - t.with_timezone(&chrono::Utc)
+                >= chrono::Duration::from_std(min_last_synced_refresh).unwrap_or_default()
+        });
+    stale.then_some(status)
+}
+
 async fn update_status(
     pool: &OutpostPool,
     ctx: &Context,
     status: OutpostPoolStatus,
     ns: &str,
 ) -> crate::Result<()> {
+    let Some(status) =
+        prepare_status_patch(pool.status.as_ref(), status, ctx.config.reconcile_interval)
+    else {
+        return Ok(());
+    };
     let pools: Api<OutpostPool> = Api::namespaced(ctx.client.clone(), ns);
     pools
         .patch_status(
@@ -698,4 +768,73 @@ async fn cleanup(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<Requeue
 
     info!(pool = %pool.spec.pool_id, "pool cleaned up");
     Ok(RequeueAction::await_change())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(phase: &str, message: Option<&str>, last_synced: Option<&str>) -> OutpostPoolStatus {
+        OutpostPoolStatus {
+            phase: Some(phase.to_string()),
+            claimed_sessions: 0,
+            last_synced: last_synced.map(str::to_string),
+            watch_cursor: None,
+            conditions: vec![Condition {
+                type_: "Ready".to_string(),
+                status: (phase == "Ready").to_string(),
+                reason: Some(
+                    if phase == "Ready" {
+                        "Synced"
+                    } else {
+                        "SyncFailed"
+                    }
+                    .to_string(),
+                ),
+                message: message.map(str::to_string),
+                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+            }],
+        }
+    }
+
+    #[test]
+    fn unchanged_failing_status_is_not_patched() {
+        let old = status("Unauthorized", Some("403"), Some("2026-01-01T00:00:00Z"));
+        let new = status("Unauthorized", Some("403"), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            prepare_status_patch(Some(&old), new, Duration::from_secs(30)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_transition_is_patched_and_stamps_a_new_transition_time() {
+        let old = status("Unauthorized", Some("403"), Some("2026-01-01T00:00:00Z"));
+        let new = status("Ready", None, Some("2026-01-01T00:00:30Z"));
+        let patched = prepare_status_patch(Some(&old), new.clone(), Duration::from_secs(30));
+        assert_eq!(patched, Some(new));
+    }
+
+    #[test]
+    fn unchanged_condition_keeps_its_transition_time() {
+        let old = status("Ready", None, Some("2026-01-01T00:00:00Z"));
+        let new = status("Ready", None, None);
+        let patched = prepare_status_patch(Some(&old), new, Duration::from_secs(30))
+            .expect("stale lastSynced refresh");
+        assert_eq!(
+            patched.conditions[0].last_transition_time,
+            old.conditions[0].last_transition_time
+        );
+    }
+
+    #[test]
+    fn fresh_last_synced_only_change_is_skipped() {
+        let just_now = chrono::Utc::now().to_rfc3339();
+        let old = status("Ready", None, Some(&just_now));
+        let new = status("Ready", None, Some(&chrono::Utc::now().to_rfc3339()));
+        assert_eq!(
+            prepare_status_patch(Some(&old), new, Duration::from_secs(30)),
+            None
+        );
+    }
 }

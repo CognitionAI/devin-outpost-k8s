@@ -214,7 +214,7 @@ pub enum ResumePolicy {
 }
 
 /// Observed state of an [`OutpostPool`].
-#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OutpostPoolStatus {
     /// High-level reconcile phase (e.g. `Ready`, `Degraded`, `Unauthorized`).
@@ -239,7 +239,7 @@ pub struct OutpostPoolStatus {
 }
 
 /// A minimal Kubernetes-style status condition.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
     /// Condition type, e.g. `Ready`.

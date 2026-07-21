@@ -29,6 +29,11 @@ pub struct Observed<'a> {
     pub restart_limit: u32,
     /// Renew claims whose deadline is within this margin (seconds).
     pub renew_margin_secs: i64,
+    /// Name of the worker container within the pod (`worker.containerName`).
+    pub container_name: &'a str,
+    /// Image the operator would set on a newly created worker pod (the pool's
+    /// `worker.overrides.image` or the operator default).
+    pub desired_image: &'a str,
     /// Current unix time (seconds); injected for testability.
     pub now: i64,
 }
@@ -58,6 +63,13 @@ pub enum Action {
     /// The worker pod completed while its session is still live: delete it;
     /// the next pass recreates it via [`Action::StartWorker`].
     ReplaceSucceededPod { session_id: String },
+    /// The worker is crash-looping on an image that no longer matches what
+    /// the operator would create (the pool/default image changed since the
+    /// pod was built): delete it so the next pass recreates it with the
+    /// current spec instead of looping toward [`Action::GiveUp`] on the
+    /// stale one. Healthy workers are left alone — a live session must not
+    /// be restarted by an image rollout.
+    ReplaceDriftedPod { session_id: String },
     /// Delete a pod that no longer maps to any live claim of ours (session
     /// gone from the queue, or claimed by another worker).
     DeleteOrphanPod { pod_name: String },
@@ -80,6 +92,35 @@ fn pod_succeeded(pod: &Pod) -> bool {
         .as_ref()
         .and_then(|s| s.phase.as_deref())
         .is_some_and(|phase| phase == "Succeeded")
+}
+
+/// Whether the pod is failing to come up: a container sits in
+/// `CrashLoopBackOff`, or has restarted and still isn't ready.
+fn pod_crash_looping(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|cs| {
+            let backoff = cs
+                .state
+                .as_ref()
+                .and_then(|s| s.waiting.as_ref())
+                .and_then(|w| w.reason.as_deref())
+                == Some("CrashLoopBackOff");
+            backoff || (cs.restart_count > 0 && !cs.ready)
+        })
+}
+
+fn worker_image<'a>(pod: &'a Pod, container_name: &str) -> Option<&'a str> {
+    pod.spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|c| c.name == container_name)?
+        .image
+        .as_deref()
 }
 
 /// Compute the actions for one reconcile pass.
@@ -120,6 +161,10 @@ pub fn plan(observed: &Observed<'_>) -> Vec<Action> {
                         restarts,
                     });
                     active_ours -= 1;
+                } else if pod_crash_looping(pod)
+                    && worker_image(pod, observed.container_name) != Some(observed.desired_image)
+                {
+                    actions.push(Action::ReplaceDriftedPod { session_id });
                 } else if session
                     .status
                     .claim_deadline
@@ -257,8 +302,30 @@ mod tests {
             max_concurrent: 2,
             restart_limit: 3,
             renew_margin_secs: 60,
+            container_name: "devin-worker",
+            desired_image: "img:current",
             now: 0,
         }
+    }
+
+    fn pod_with_image(phase: &str, restarts: i32, ready: bool, image: &str) -> Pod {
+        let mut pod = pod(phase, restarts);
+        pod.status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0]
+            .ready = ready;
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            containers: vec![k8s_openapi::api::core::v1::Container {
+                name: "devin-worker".to_string(),
+                image: Some(image.to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        pod
     }
 
     #[test]
@@ -363,6 +430,42 @@ mod tests {
         assert!(actions.contains(&Action::Claim {
             session_id: "waiting".into()
         }));
+    }
+
+    #[test]
+    fn replaces_crash_looping_pods_whose_image_drifted() {
+        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
+        let pods = BTreeMap::from([(
+            "s".to_string(),
+            pod_with_image("Running", 2, false, "img:stale"),
+        )]);
+        assert_eq!(
+            plan(&observed(&sessions, &pods, &[])),
+            vec![Action::ReplaceDriftedPod {
+                session_id: "s".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn crash_looping_pods_on_the_current_image_are_left_to_the_restart_limit() {
+        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
+        let pods = BTreeMap::from([(
+            "s".to_string(),
+            pod_with_image("Running", 2, false, "img:current"),
+        )]);
+        // Deadline 1000, now 0, margin 60 => no renewal either.
+        assert_eq!(plan(&observed(&sessions, &pods, &[])), vec![]);
+    }
+
+    #[test]
+    fn healthy_pods_are_not_replaced_on_image_drift() {
+        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
+        let pods = BTreeMap::from([(
+            "s".to_string(),
+            pod_with_image("Running", 0, true, "img:stale"),
+        )]);
+        assert_eq!(plan(&observed(&sessions, &pods, &[])), vec![]);
     }
 
     #[test]
