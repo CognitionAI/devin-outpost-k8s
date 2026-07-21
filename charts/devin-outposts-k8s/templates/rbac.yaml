@@ -1,0 +1,54 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "devin-outposts-k8s.fullname" . }}
+  labels:
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
+rules:
+  # Reconcile the operator's own custom resources + status.
+  - apiGroups: ["outposts.cognition.com"]
+    resources: ["outpostpools", "outpostpools/status", "outpostpools/finalizers"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Manage one worker Pod per claimed session.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # Read the per-pool token Secret; create/delete the per-session connect-token
+  # Secrets injected into worker pods.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # Persist the generated acceptor ID (when operator.acceptorId is unset).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election (see the elector docs).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # Retained per-session state volumes (FilesystemSnapshot resume policy).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # GKE pod snapshots (GkeSnapshot resume policy). Absent from non-GKE
+  # clusters; the rule is inert there.
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "devin-outposts-k8s.fullname" . }}
+  labels:
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "devin-outposts-k8s.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "devin-outposts-k8s.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

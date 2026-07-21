@@ -1,0 +1,15 @@
+devin-outposts-k8s {{ .Chart.AppVersion }} installed as {{ include "devin-outposts-k8s.fullname" . }}.
+
+{{- if .Values.defaultPool.enabled }}
+
+A default OutpostPool "{{ include "devin-outposts-k8s.fullname" . }}-default" was created for pool {{ .Values.defaultPool.poolId | quote }}.
+{{- else }}
+
+No OutpostPool was created. Create one to start serving a pool, e.g.:
+
+  kubectl apply -f https://raw.githubusercontent.com/CognitionAI/outposts-kubernetes/main/examples/outpostpool.yaml
+
+Or re-install with --set defaultPool.enabled=true --set defaultPool.poolId=<id> ...
+{{- end }}
+
+Metrics: {{ if .Values.metrics.service.enabled }}http://{{ include "devin-outposts-k8s.fullname" . }}-metrics.{{ .Release.Namespace }}:{{ .Values.metrics.service.port }}/metrics{{ else }}disabled{{ end }}

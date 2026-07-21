@@ -1,0 +1,17 @@
+apiVersion: v2
+name: devin-outposts-k8s
+description: Kubernetes operator that runs Devin Outposts (BYOB) workers on any certified Kubernetes cluster.
+type: application
+# Chart version; bump on chart changes.
+version: 0.1.0
+# Version of the operator image this chart deploys by default.
+appVersion: "0.1.0"
+home: https://github.com/CognitionAI/outposts-kubernetes
+sources:
+  - https://github.com/CognitionAI/outposts-kubernetes
+keywords:
+  - devin
+  - outposts
+  - operator
+maintainers:
+  - name: Cognition

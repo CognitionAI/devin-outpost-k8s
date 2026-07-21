@@ -1,0 +1,140 @@
+# Default values for the devin-outposts-k8s chart.
+
+# -- Operator container image.
+image:
+  # CR-soon nikhil: replace with the release registry/tag once publishing settles.
+  repository: public.ecr.aws/e0h8a4b6/devin-k8s-controller
+  tag: "latest"      # empty => .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for the operator deployment.
+imagePullSecrets: []
+
+# -- Number of operator replicas. One replica leads (via a coordination.k8s.io
+# Lease) while the rest stand by; failover stays well inside the ~5min
+# upstream claim TTL.
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount for the operator.
+  create: true
+  # -- Annotations for the ServiceAccount (e.g. GKE Workload Identity binding).
+  annotations: {}
+  # -- Name to use; generated from the release name when empty.
+  name: ""
+
+rbac:
+  # -- Create the ClusterRole/ClusterRoleBinding the operator needs.
+  create: true
+
+# -- Resource requests/limits for the operator pod (not worker pods).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# -- Operator process settings.
+operator:
+  # -- Namespace to watch. Empty => all namespaces (cluster-wide).
+  watchNamespace: ""
+  # -- Default upstream Outposts API base URL when a pool does not override it.
+  defaultApiUrl: "https://api.devin.ai"
+  # -- Identity used when claiming sessions upstream; must be unique within the
+  # account and stable for this install. Empty => the operator generates one and
+  # persists it in a ConfigMap.
+  acceptorId: ""
+  # -- Default worker image when a pool does not pin one (worker.overrides.image).
+  # Only the `stable` tag is supported; never pin a versioned tag.
+  defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:stable"
+  logFormat: text   # text | json
+  logLevel: info
+
+# The OutpostPool CRD ships in the chart's crds/ directory so it is installed
+# before the templates are validated (a fresh install can therefore include a
+# defaultPool). Helm never upgrades crds/: apply the new CRD manually when
+# upgrading the operator:
+#   kubectl apply -f charts/devin-outposts-k8s/crds/outpostpool.yaml
+# Use `helm install --skip-crds` to opt out of installing it.
+
+metrics:
+  # -- Expose the Prometheus /metrics endpoint via a Service.
+  service:
+    enabled: true
+    port: 8080
+  # -- Create a Prometheus Operator ServiceMonitor.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# -- Easy path: deploy a single OutpostPool alongside the operator so a fresh
+# install is functional with just a pool ID and token. Set defaultPool.enabled
+# to false to manage OutpostPool resources yourself.
+defaultPool:
+  enabled: false
+  # -- Upstream pool ID to serve.
+  poolId: ""
+  # -- API URL override for this pool (falls back to operator.defaultApiUrl).
+  apiUrl: ""
+  # -- Max sessions this pool runs concurrently.
+  maxConcurrentSessions: 10
+
+  # -- How resume-kind sessions are served.
+  resume:
+    # -- StartFresh | GkeSnapshot | FilesystemSnapshot. The policy alone decides
+    # whether snapshots are taken on suspend.
+    policy: StartFresh
+    # -- Snapshot retention in seconds. Empty => keep until session terminated.
+    snapshotTtlSeconds: null
+    # -- Per-session state volume size (FilesystemSnapshot only). Empty => 20Gi.
+    volumeSize: ""
+    # -- StorageClass for state volumes (FilesystemSnapshot only). Empty =>
+    # cluster default.
+    storageClassName: ""
+    # -- Name of an admin-provided PodSnapshotStorageConfig (GkeSnapshot only).
+    gkeStorageConfigName: ""
+
+  token:
+    # -- Account PAT (UseOutpostsMachine). When existingSecret is empty, a Secret
+    # is created from this value. Prefer existingSecret over inlining the PAT.
+    value: ""
+    # -- Use a pre-existing Secret instead of creating one from value above.
+    existingSecret: ""
+    secretKey: token
+
+  # -- Convenience knobs rendered into the OutpostPool's layered worker template
+  # (see examples/outpostpool.yaml for the full shape).
+  worker:
+    # -- Pin the worker image for this pool. Empty => operator.defaultWorkerImage.
+    image: ""
+    imagePullPolicy: IfNotPresent
+    imagePullSecrets: []
+    # -- Pod resource requests/limits for each worker (global per pool).
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    nodeSelector: {}
+    tolerations: []
+    # -- Sandbox runtime class (e.g. gvisor, kata). Empty => cluster default.
+    runtimeClassName: ""
+    serviceAccountName: ""
+    # -- Extra annotations on worker pods (e.g. GKE Autopilot compute class).
+    annotations: {}
+    # -- Extra labels on worker pods.
+    labels: {}

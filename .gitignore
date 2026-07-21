@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Helm packaging artifacts
+*.tgz
+
+# Local env / secrets
+.env
+*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

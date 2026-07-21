@@ -1,0 +1,95 @@
+{{- if .Values.defaultPool.enabled -}}
+{{- $dp := .Values.defaultPool -}}
+{{- if not $dp.poolId -}}
+{{- fail "defaultPool.enabled=true requires defaultPool.poolId" -}}
+{{- end -}}
+{{- $secretName := $dp.token.existingSecret | default (printf "%s-default-pool-token" (include "devin-outposts-k8s.fullname" .)) -}}
+{{- if not $dp.token.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ $dp.token.secretKey }}: {{ required "set defaultPool.token.value (or point defaultPool.token.existingSecret at a Secret)" $dp.token.value | quote }}
+---
+{{- end }}
+apiVersion: outposts.cognition.com/v1alpha1
+kind: OutpostPool
+metadata:
+  name: {{ include "devin-outposts-k8s.fullname" . }}-default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
+spec:
+  poolId: {{ $dp.poolId | quote }}
+  tokenSecretRef:
+    name: {{ $secretName }}
+    key: {{ $dp.token.secretKey }}
+  {{- with $dp.apiUrl }}
+  apiUrl: {{ . | quote }}
+  {{- end }}
+  maxConcurrentSessions: {{ $dp.maxConcurrentSessions }}
+  resume:
+    policy: {{ $dp.resume.policy }}
+    {{- with $dp.resume.snapshotTtlSeconds }}
+    snapshotTtlSeconds: {{ . }}
+    {{- end }}
+    {{- with $dp.resume.volumeSize }}
+    volumeSize: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.resume.storageClassName }}
+    storageClassName: {{ . | quote }}
+    {{- end }}
+    {{- with $dp.resume.gkeStorageConfigName }}
+    gkeStorageConfigName: {{ . | quote }}
+    {{- end }}
+  # The flat defaultPool.worker.* values are rendered into the layered worker
+  # template the CRD expects (see examples/outpostpool.yaml for the full shape).
+  worker:
+    template:
+      {{- if or $dp.worker.annotations $dp.worker.labels }}
+      metadata:
+        {{- with $dp.worker.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.labels }}
+        labels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      spec:
+        {{- with $dp.worker.runtimeClassName }}
+        runtimeClassName: {{ . | quote }}
+        {{- end }}
+        {{- with $dp.worker.serviceAccountName }}
+        serviceAccountName: {{ . | quote }}
+        {{- end }}
+        {{- with $dp.worker.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $dp.worker.imagePullSecrets }}
+        imagePullSecrets:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        containers:
+          - name: devin-worker
+            imagePullPolicy: {{ $dp.worker.imagePullPolicy }}
+            {{- with $dp.worker.resources }}
+            resources:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+    {{- if $dp.worker.image }}
+    overrides:
+      image: {{ $dp.worker.image | quote }}
+    {{- end }}
+{{- end }}

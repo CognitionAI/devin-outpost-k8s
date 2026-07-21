@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "devin-outposts-k8s.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devin-outposts-k8s.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "devin-outposts-k8s.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "devin-outposts-k8s.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "devin-outposts-k8s.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Downward API identity for leader election + the acceptor-ID
+            # ConfigMap's namespace.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: METRICS_ADDR
+              value: ":{{ .Values.metrics.service.port }}"
+            - name: WATCH_NAMESPACE
+              value: {{ .Values.operator.watchNamespace | quote }}
+            - name: DEVIN_API_URL
+              value: {{ .Values.operator.defaultApiUrl | quote }}
+            - name: DEVIN_WORKER_IMAGE
+              value: {{ .Values.operator.defaultWorkerImage | quote }}
+            - name: ACCEPTOR_ID
+              value: {{ .Values.operator.acceptorId | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.operator.logFormat | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.operator.logLevel | quote }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.service.port }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
