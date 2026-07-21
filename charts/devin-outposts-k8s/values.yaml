@@ -1,11 +1,12 @@
 # Default values for the devin-outposts-k8s chart.
 
-# -- Operator container image.
+# -- Operator container image, published by .github/workflows/publish.yaml on
+# every push to main (`latest` plus a `sha-<commit>` tag).
 image:
-  # CR-soon nikhil: replace with the release registry/tag once publishing settles.
-  repository: public.ecr.aws/e0h8a4b6/devin-k8s-controller
+  repository: ghcr.io/cognitionai/devin-outposts-k8s
   tag: "latest"      # empty => .Chart.AppVersion
-  pullPolicy: IfNotPresent
+  # `latest` is mutable, so repull on pod (re)creation.
+  pullPolicy: Always
 
 # -- Image pull secrets for the operator deployment.
 imagePullSecrets: []

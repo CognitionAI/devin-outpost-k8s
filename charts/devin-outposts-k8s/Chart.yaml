@@ -6,9 +6,9 @@ type: application
 version: 0.1.0
 # Version of the operator image this chart deploys by default.
 appVersion: "0.1.0"
-home: https://github.com/CognitionAI/outposts-kubernetes
+home: https://github.com/CognitionAI/devin-outpost-k8s
 sources:
-  - https://github.com/CognitionAI/outposts-kubernetes
+  - https://github.com/CognitionAI/devin-outpost-k8s
 keywords:
   - devin
   - outposts

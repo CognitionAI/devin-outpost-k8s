@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 description = "A Kubernetes operator that runs Devin Outposts."
-repository = "https://github.com/CognitionAI/outposts-kubernetes"
+repository = "https://github.com/CognitionAI/devin-outpost-k8s"
 readme = "README.md"
 default-run = "devin-outposts-k8s"
 
@@ -25,7 +25,6 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 # Manually pinned to the third-most recent minor release (v1_34).
-# CR-soon nikhil: Is this actually the correct behavior? Should we track latest instead?
 k8s-openapi = { version = "0.28", features = ["v1_34", "schemars"] }
 kube = { version = "4.0", features = ["runtime", "derive", "client"] }
 prometheus-client = "0.25"

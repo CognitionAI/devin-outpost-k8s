@@ -7,7 +7,7 @@ A default OutpostPool "{{ include "devin-outposts-k8s.fullname" . }}-default" wa
 
 No OutpostPool was created. Create one to start serving a pool, e.g.:
 
-  kubectl apply -f https://raw.githubusercontent.com/CognitionAI/outposts-kubernetes/main/examples/outpostpool.yaml
+  kubectl apply -f https://raw.githubusercontent.com/CognitionAI/devin-outpost-k8s/main/examples/outpostpool.yaml
 
 Or re-install with --set defaultPool.enabled=true --set defaultPool.poolId=<id> ...
 {{- end }}
