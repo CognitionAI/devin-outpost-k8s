@@ -47,8 +47,8 @@ pub enum SnapshotOutcome {
 /// (see [`SnapshotProvider::prepare`]).
 #[derive(Debug, Clone, Default)]
 pub struct PreparedSession {
-    /// Name of a `PersistentVolumeClaim` the pod must mount at
-    /// [`crate::controller::WORKER_DATA_DIR`].
+    /// Name of a `PersistentVolumeClaim` the pod must mount as the worker's
+    /// home directory (see [`crate::controller::build_worker_pod`]).
     pub state_pvc_name: Option<String>,
     /// Annotations to add to the worker pod (e.g. pinning the snapshot to
     /// restore from).

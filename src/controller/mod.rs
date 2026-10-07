@@ -62,8 +62,8 @@ pub use plan::{Action, Observed, next_claim_deadline, plan, pod_restart_count};
 pub use pod::{
     ANNOTATION_POOL_ID, ANNOTATION_SUSPENDED_AT, DEFAULT_WORKER_IMAGE, ENV_GATEWAY_URL,
     ENV_REMOTE_BINARY_SHA, ENV_SESSION_TOKEN, ENV_WORKER_CACHE_DIR, LABEL_MANAGED_BY, LABEL_POOL,
-    LABEL_SESSION_ID, SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_DIR, WorkerPodParams,
-    build_session_token_secret, build_state_pvc, build_worker_pod, session_labels,
+    LABEL_SESSION_ID, SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_SUBDIR,
+    WorkerPodParams, build_session_token_secret, build_state_pvc, build_worker_pod, session_labels,
     session_token_secret_name, state_pvc_name, worker_pod_name,
 };
 pub use queue_watch::PoolWatchers;

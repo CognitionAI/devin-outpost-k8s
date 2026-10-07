@@ -1,6 +1,6 @@
 //! Filesystem snapshot provider for the `FilesystemSnapshot` policy.
 //!
-//! Portable fallback for non-GKE clusters: the worker's data directory lives
+//! Portable fallback for non-GKE clusters: the worker's home directory lives
 //! on a per-session `PersistentVolumeClaim` that is *retained* when the
 //! session suspends and re-mounted by the recreated pod on resume — the
 //! volume itself is the snapshot. Unlike GKE pod snapshots, only filesystem
