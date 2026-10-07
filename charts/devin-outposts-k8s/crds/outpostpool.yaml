@@ -75,6 +75,11 @@
                         "nullable": true,
                         "type": "string"
                       },
+                      "homeDir": {
+                        "description": "Home directory of the worker container; the per-session state volume\nis mounted here and `HOME` is set to it, so repos and anything Devin\ninstalls under it survive suspend/resume\n([`ResumePolicy::FilesystemSnapshot`] only). Defaults to\n[`ResumeConfig::DEFAULT_HOME_DIR`].",
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "policy": {
                         "default": "StartFresh",
                         "description": "Strategy for serving resume-kind sessions.",
@@ -96,6 +101,29 @@
                         "description": "`StorageClass` for the per-session state volume\n([`ResumePolicy::FilesystemSnapshot`] only). `None` => the cluster\ndefault class.",
                         "nullable": true,
                         "type": "string"
+                      },
+                      "volumeDataSource": {
+                        "description": "`VolumeSnapshot` or `PersistentVolumeClaim` in the pool's namespace\nthat new state volumes are cloned from (PVC `spec.dataSource`). It must\nhold a home directory for the worker image, at minimum a copy of the\none the image ships (see `examples/golden-home.yaml`). Required for\nthe [`ResumePolicy::FilesystemSnapshot`] policy.",
+                        "nullable": true,
+                        "properties": {
+                          "apiGroup": {
+                            "description": "APIGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required.",
+                            "type": "string"
+                          },
+                          "kind": {
+                            "description": "Kind is the type of resource being referenced",
+                            "type": "string"
+                          },
+                          "name": {
+                            "description": "Name is the name of resource being referenced",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "name"
+                        ],
+                        "type": "object"
                       },
                       "volumeSize": {
                         "description": "Size of the per-session state volume created for the\n[`ResumePolicy::FilesystemSnapshot`] policy (a Kubernetes quantity,\ne.g. `20Gi`). Defaults to [`ResumeConfig::DEFAULT_VOLUME_SIZE`].",

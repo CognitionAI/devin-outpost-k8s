@@ -27,9 +27,13 @@ spec:
     # Snapshot retention in seconds; omit to keep until the session terminates.
     # snapshotTtlSeconds: 86400
     #
-    # FilesystemSnapshot only — the per-session state volume:
+    # FilesystemSnapshot only — the per-session state volume, mounted as the
+    # worker's home directory and cloned from a golden volume (required; see
+    # examples/golden-home.yaml for building one):
+    # volumeDataSource: { apiGroup: snapshot.storage.k8s.io, kind: VolumeSnapshot, name: golden-home }
     # volumeSize: 20Gi
     # storageClassName: premium-rwo
+    # homeDir: /home/ubuntu
     #
     # GkeSnapshot only — an admin-provided PodSnapshotStorageConfig in this
     # namespace (also requires runtimeClassName: gvisor on the worker):

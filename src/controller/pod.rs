@@ -27,10 +27,15 @@
 //! - [`ENV_REMOTE_BINARY_SHA`] carries `spec.remote_binary_sha` when the queue
 //!   item pins one; unset otherwise (the worker then uses the latest published
 //!   binary).
-//! - For pools with the `FilesystemSnapshot` resume policy, the worker's data
-//!   directory is redirected onto a per-session volume by setting
-//!   [`ENV_WORKER_CACHE_DIR`] to `<`[`WORKER_DATA_DIR`]`>/cache` (the worker
-//!   derives its per-session state dir from the cache dir's parent).
+//! - For pools with the `FilesystemSnapshot` resume policy, the per-session
+//!   volume is mounted as the worker container's home directory
+//!   (`resume.homeDir`, also exported as [`ENV_HOME`]) so repos and anything
+//!   Devin installs under it survive suspend/resume. The worker's data
+//!   directory is redirected under it by setting [`ENV_WORKER_CACHE_DIR`] to
+//!   `<homeDir>/`[`WORKER_DATA_SUBDIR`]`/cache` (the worker derives its
+//!   per-session state dir from the cache dir's parent). The mount hides
+//!   whatever the image ships in that directory, so new volumes are cloned
+//!   from `resume.volumeDataSource` (see [`build_state_pvc`]).
 
 use std::collections::BTreeMap;
 
@@ -64,11 +69,14 @@ pub const ENV_SESSION_TOKEN: &str = "DEVIN_REMOTE_SESSION_TOKEN";
 /// Env var carrying `spec.remote_binary_sha`, when set.
 pub const ENV_REMOTE_BINARY_SHA: &str = "DEVIN_WORKER_REMOTE_SHA";
 /// Env var redirecting the worker's binary cache (and, via its parent, the
-/// per-session state dir) onto [`WORKER_DATA_DIR`].
+/// per-session state dir) under the home volume.
 pub const ENV_WORKER_CACHE_DIR: &str = "DEVIN_WORKER_CACHE_DIR";
+/// Env var naming the worker container's home directory.
+pub const ENV_HOME: &str = "HOME";
 
-/// Mount point of the per-session state volume inside the worker container.
-pub const WORKER_DATA_DIR: &str = "/var/lib/devin-worker";
+/// Subdirectory of the home volume holding the worker's binary cache and
+/// per-session state dir.
+pub const WORKER_DATA_SUBDIR: &str = ".devin-worker";
 
 /// Name of the per-session state volume in the pod spec.
 const STATE_VOLUME_NAME: &str = "outpost-state";
@@ -176,8 +184,8 @@ pub struct WorkerPodParams<'a> {
     /// `worker.overrides.image` is unset (see [`DEFAULT_WORKER_IMAGE`] /
     /// [`crate::config::OperatorConfig`]).
     pub default_image: &'a str,
-    /// Name of the per-session state `PersistentVolumeClaim` to mount at
-    /// [`WORKER_DATA_DIR`], when the pool's resume policy keeps one (see
+    /// Name of the per-session state `PersistentVolumeClaim` to mount as the
+    /// worker's home directory, when the pool's resume policy keeps one (see
     /// [`build_state_pvc`]).
     pub state_pvc_name: Option<&'a str>,
     /// Annotations required by the pool's snapshot provider (e.g. the GKE
@@ -219,12 +227,19 @@ pub fn build_session_token_secret(
 
 /// Build the per-session state `PersistentVolumeClaim` backing the
 /// `FilesystemSnapshot` resume policy (see [`crate::snapshot`] for when it is
-/// created, retained and deleted).
+/// created, retained and deleted). It is cloned from `resume.volumeDataSource`
+/// rather than created empty: the volume becomes the worker's home directory,
+/// and an empty one would hide everything the image ships there.
 pub fn build_state_pvc(
     pool: &OutpostPool,
     session_id: &str,
     resume: &ResumeConfig,
 ) -> Result<PersistentVolumeClaim> {
+    let data_source = resume.volume_data_source.clone().ok_or_else(|| {
+        Error::Config(
+            "resume.volumeDataSource is required for the FilesystemSnapshot policy".to_string(),
+        )
+    })?;
     let size = resume
         .volume_size
         .clone()
@@ -241,6 +256,7 @@ pub fn build_state_pvc(
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".to_string()]),
             storage_class_name: resume.storage_class_name.clone(),
+            data_source: Some(data_source),
             resources: Some(VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([("storage".to_string(), Quantity(size))])),
                 ..Default::default()
@@ -341,9 +357,15 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         });
     }
     if let Some(pvc_name) = state_pvc_name {
+        let home_dir = pool.spec.resume.home_dir();
+        operator_env.push(EnvVar {
+            name: ENV_HOME.to_string(),
+            value: Some(home_dir.to_string()),
+            ..Default::default()
+        });
         operator_env.push(EnvVar {
             name: ENV_WORKER_CACHE_DIR.to_string(),
-            value: Some(format!("{WORKER_DATA_DIR}/cache")),
+            value: Some(format!("{home_dir}/{WORKER_DATA_SUBDIR}/cache")),
             ..Default::default()
         });
         container
@@ -351,7 +373,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
             .get_or_insert_default()
             .push(VolumeMount {
                 name: STATE_VOLUME_NAME.to_string(),
-                mount_path: WORKER_DATA_DIR.to_string(),
+                mount_path: home_dir.to_string(),
                 ..Default::default()
             });
         spec.volumes.get_or_insert_default().push(Volume {
@@ -415,7 +437,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
 
 #[cfg(test)]
 mod tests {
-    use k8s_openapi::api::core::v1::PodTemplateSpec;
+    use k8s_openapi::api::core::v1::{PodTemplateSpec, TypedLocalObjectReference};
 
     use crate::api::{Kind, Metadata, OutpostDevin, Phase, SessionStatus, Spec, Status};
     use crate::crd::{OutpostPoolSpec, SecretKeyRef, WorkerOverrides, WorkerTemplate};
@@ -655,12 +677,39 @@ mod tests {
             .iter()
             .find(|m| m.name == STATE_VOLUME_NAME)
             .unwrap();
-        assert_eq!(mount.mount_path, WORKER_DATA_DIR);
+        assert_eq!(mount.mount_path, ResumeConfig::DEFAULT_HOME_DIR);
         let env = worker.env.as_ref().unwrap();
+        let home = env.iter().find(|e| e.name == ENV_HOME).unwrap();
+        assert_eq!(home.value.as_deref(), Some(ResumeConfig::DEFAULT_HOME_DIR));
         let cache_dir = env.iter().find(|e| e.name == ENV_WORKER_CACHE_DIR).unwrap();
         assert_eq!(
             cache_dir.value.as_deref(),
-            Some(format!("{WORKER_DATA_DIR}/cache").as_str())
+            Some("/home/ubuntu/.devin-worker/cache")
+        );
+    }
+
+    #[test]
+    fn home_dir_override_moves_the_mount() {
+        let mut pool = pool();
+        pool.spec.resume.home_dir = Some("/workspace".to_string());
+        let session = session("devin-1");
+        let mut p = params(&pool, &session);
+        let pvc_name = state_pvc_name("devin-1");
+        p.state_pvc_name = Some(&pvc_name);
+        let pod = build_worker_pod(p).unwrap();
+
+        let spec = pod.spec.as_ref().unwrap();
+        let worker = &spec.containers[0];
+        let mount = worker.volume_mounts.as_ref().unwrap().last().unwrap();
+        assert_eq!(mount.mount_path, "/workspace");
+        let env = worker.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == ENV_HOME)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("/workspace")
         );
     }
 
@@ -723,7 +772,7 @@ mod tests {
     #[test]
     fn state_pvc_uses_configured_size_and_class() {
         let pool = pool();
-        let pvc = build_state_pvc(&pool, "devin-1", &Default::default()).unwrap();
+        let pvc = build_state_pvc(&pool, "devin-1", &golden_resume()).unwrap();
         let spec = pvc.spec.as_ref().unwrap();
         assert_eq!(
             spec.resources.as_ref().unwrap().requests.as_ref().unwrap()["storage"].0,
@@ -734,7 +783,7 @@ mod tests {
         let resume = ResumeConfig {
             volume_size: Some("100Gi".to_string()),
             storage_class_name: Some("fast".to_string()),
-            ..Default::default()
+            ..golden_resume()
         };
         let pvc = build_state_pvc(&pool, "devin-1", &resume).unwrap();
         let spec = pvc.spec.as_ref().unwrap();
@@ -743,5 +792,27 @@ mod tests {
             "100Gi"
         );
         assert_eq!(spec.storage_class_name.as_deref(), Some("fast"));
+    }
+
+    fn golden_resume() -> ResumeConfig {
+        ResumeConfig {
+            volume_data_source: Some(TypedLocalObjectReference {
+                api_group: Some("snapshot.storage.k8s.io".to_string()),
+                kind: "VolumeSnapshot".to_string(),
+                name: "golden-home".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn state_pvc_requires_and_clones_the_data_source() {
+        let pool = pool();
+        let err = build_state_pvc(&pool, "devin-1", &Default::default()).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+
+        let resume = golden_resume();
+        let pvc = build_state_pvc(&pool, "devin-1", &resume).unwrap();
+        assert_eq!(pvc.spec.unwrap().data_source, resume.volume_data_source);
     }
 }

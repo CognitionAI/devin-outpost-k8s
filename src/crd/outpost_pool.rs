@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::PodTemplateSpec;
+use k8s_openapi::api::core::v1::{PodTemplateSpec, TypedLocalObjectReference};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -180,6 +180,22 @@ pub struct ResumeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
 
+    /// Home directory of the worker container; the per-session state volume
+    /// is mounted here and `HOME` is set to it, so repos and anything Devin
+    /// installs under it survive suspend/resume
+    /// ([`ResumePolicy::FilesystemSnapshot`] only). Defaults to
+    /// [`ResumeConfig::DEFAULT_HOME_DIR`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+
+    /// `VolumeSnapshot` or `PersistentVolumeClaim` in the pool's namespace
+    /// that new state volumes are cloned from (PVC `spec.dataSource`). It must
+    /// hold a home directory for the worker image, at minimum a copy of the
+    /// one the image ships (see `examples/golden-home.yaml`). Required for
+    /// the [`ResumePolicy::FilesystemSnapshot`] policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_data_source: Option<TypedLocalObjectReference>,
+
     /// Name of the `PodSnapshotStorageConfig` (in the pool's namespace) that
     /// GKE pod snapshots are stored through. Required for the
     /// [`ResumePolicy::GkeSnapshot`] policy; the storage config (and its GCS
@@ -193,6 +209,13 @@ impl ResumeConfig {
     /// Default size of the per-session state volume for
     /// [`ResumePolicy::FilesystemSnapshot`].
     pub const DEFAULT_VOLUME_SIZE: &str = "20Gi";
+    /// Default [`ResumeConfig::home_dir`]; matches the published worker image.
+    pub const DEFAULT_HOME_DIR: &str = "/home/ubuntu";
+
+    /// [`ResumeConfig::home_dir`] or its default.
+    pub fn home_dir(&self) -> &str {
+        self.home_dir.as_deref().unwrap_or(Self::DEFAULT_HOME_DIR)
+    }
 }
 
 /// Strategy for serving `resume`-kind sessions. Policies other than

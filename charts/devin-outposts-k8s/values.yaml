@@ -104,6 +104,12 @@ defaultPool:
     # -- StorageClass for state volumes (FilesystemSnapshot only). Empty =>
     # cluster default.
     storageClassName: ""
+    # -- Worker home directory the state volume is mounted at (FilesystemSnapshot
+    # only). Empty => /home/ubuntu.
+    homeDir: ""
+    # -- VolumeSnapshot or PVC holding the worker home directory that new state
+    # volumes are cloned from. Required for FilesystemSnapshot.
+    volumeDataSource: {}
     # -- Name of an admin-provided PodSnapshotStorageConfig (GkeSnapshot only).
     gkeStorageConfigName: ""
 

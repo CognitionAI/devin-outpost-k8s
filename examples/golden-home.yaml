@@ -1,0 +1,49 @@
+# Builds the golden home volume that a FilesystemSnapshot pool clones for each
+# new session (resume.volumeDataSource): a PVC filled with the worker image's
+# home directory. Extend the command with any extra setup every session should
+# start with. Snapshot it when done (or point volumeDataSource at the PVC):
+#
+#   kubectl apply -f examples/golden-home.yaml
+#   kubectl wait --for=condition=complete job/golden-home
+#   kubectl apply -f - <<EOF
+#   apiVersion: snapshot.storage.k8s.io/v1
+#   kind: VolumeSnapshot
+#   metadata: { name: golden-home }
+#   spec: { source: { persistentVolumeClaimName: golden-home } }
+#   EOF
+#
+# Clones can't be smaller than the source, so keep this at or below the pool's
+# resume.volumeSize.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: golden-home
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: golden-home
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      # uid/gid of the image's user, so it can write to the fresh volume.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: copy
+          # Same image as the pool's workers.
+          image: public.ecr.aws/e0h8a4b6/devin-cli:stable
+          command: ["sh", "-c", "cp -a /home/ubuntu/. /mnt/home/"]
+          volumeMounts:
+            - name: home
+              mountPath: /mnt/home
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: golden-home
