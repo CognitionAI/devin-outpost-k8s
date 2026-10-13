@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Pod, Secret};
-use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, ListParams as KubeListParams, Patch, PatchParams, PostParams};
 use kube::runtime::Controller;
 use kube::runtime::controller::Action as RequeueAction;
 use kube::runtime::finalizer::{Event as FinalizerEvent, finalizer};
 use kube::runtime::watcher;
+use kube::{Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::api::{ListParams, OutpostsClient};
@@ -20,13 +20,15 @@ use crate::config::OperatorConfig;
 use crate::crd::{Condition, OutpostPool, OutpostPoolStatus};
 use crate::error::Error;
 use crate::metrics::{Metrics, PoolLabels};
+use crate::network_policy::{Enforcement, SessionPolicy, worker_infrastructure};
 use crate::snapshot::{RestoreVerdict, SnapshotOutcome, SnapshotProvider, provider_for};
 
 use super::context::Context;
 use super::plan::{Action, Observed, next_claim_deadline, plan};
 use super::pod::{
     LABEL_MANAGED_BY, LABEL_POOL, WorkerPodParams, build_session_token_secret, build_worker_pod,
-    session_token_secret_name, worker_pod_name,
+    network_policy_name, pool_owner_ref, session_token_secret_name, worker_pod_name,
+    worker_static_base_url,
 };
 use super::queue_watch::PoolWatchers;
 
@@ -469,7 +471,8 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
 }
 
 /// Claim (or renew) the session for a fresh connect token, then create its
-/// token secret and worker pod.
+/// token secret, network policy (see [`crate::network_policy`]) and worker
+/// pod.
 async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Result<()> {
     let claimed = sync.outposts.claim(session_id).await?;
     let connect_token = claimed.status.connect_token.as_deref().ok_or_else(|| {
@@ -504,6 +507,23 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         )
         .await?;
 
+    let network_policy = &claimed.spec.network_policy;
+    let enforced_through = match network_policy.enabled {
+        true => sync.ctx.network_policy_provider().await?,
+        false => None,
+    };
+    if network_policy.enabled
+        && enforced_through.is_none()
+        && sync.ctx.config.network_policy_enforcement != Enforcement::Off
+    {
+        warn!(
+            session = %session_id,
+            "session has a network policy but the cluster has no provider to enforce it; \
+             starting its worker unrestricted"
+        );
+    }
+    let policy_name = enforced_through.map(|_| network_policy_name(session_id));
+
     let pod = build_worker_pod(WorkerPodParams {
         pool: sync.pool,
         session: &claimed,
@@ -512,11 +532,38 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         default_image: &sync.ctx.config.default_worker_image,
         state_pvc_name: prepared.state_pvc_name.as_deref(),
         provider_annotations: &prepared.pod_annotations,
+        network_policy_name: policy_name.as_deref(),
     })?;
+
+    let static_base_url = worker_static_base_url(&pod, &sync.pool.spec.worker.container_name);
+    let allow = [
+        network_policy.allow.clone(),
+        worker_infrastructure(gateway_url, static_base_url),
+    ]
+    .concat();
+    let session_policy = enforced_through.map(|provider| SessionPolicy {
+        provider,
+        pool: sync.pool,
+        session_id,
+        allow: &allow,
+    });
+    if let Some(policy) = &session_policy {
+        policy
+            .apply(&sync.ctx.client, &pool_owner_ref(sync.pool)?)
+            .await?;
+    }
+
     match sync.pods.create(&PostParams::default(), &pod).await {
         Ok(created) => {
             info!(session = %session_id, pod = %created.name_any(), "started worker");
+            let pod_owner = created.owner_ref(&());
             sync.pods_by_session.insert(session_id.to_string(), created);
+            if let Some(policy) = &session_policy {
+                let pod_owner = pod_owner.ok_or_else(|| {
+                    Error::Config("created worker pod has no metadata.name/uid".into())
+                })?;
+                policy.apply(&sync.ctx.client, &pod_owner).await?;
+            }
             Ok(())
         }
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),

@@ -40,6 +40,7 @@ pub struct Row {
     pub acceptor_id: Option<String>,
     pub claim_deadline: Option<f64>,
     pub remote_binary_sha: Option<String>,
+    pub network_policy: serde_json::Value,
     pub created_at: f64,
     pub updated_at: f64,
     pub deleted_at: Option<f64>,
@@ -149,6 +150,7 @@ impl MockQueue {
             acceptor_id: None,
             claim_deadline: None,
             remote_binary_sha: None,
+            network_policy: json!({"enabled": false, "allow": []}),
             created_at: ts,
             updated_at: ts,
             deleted_at: None,
@@ -165,6 +167,19 @@ impl MockQueue {
             .find(|r| r.session_id == session_id)
             .expect("unknown session");
         row.session_status = status.to_string();
+        row.updated_at = ts;
+    }
+
+    /// Replace a row's `spec.network_policy` verbatim.
+    pub fn set_network_policy(&self, session_id: &str, network_policy: serde_json::Value) {
+        let mut state = self.state.lock().unwrap();
+        let ts = now();
+        let row = state
+            .rows
+            .iter_mut()
+            .find(|r| r.session_id == session_id)
+            .expect("unknown session");
+        row.network_policy = network_policy;
         row.updated_at = ts;
     }
 
@@ -245,6 +260,7 @@ fn row_json(row: &Row) -> serde_json::Value {
             "kind": row.kind,
             "platform": "linux",
             "remote_binary_sha": row.remote_binary_sha,
+            "network_policy": row.network_policy,
         },
         "status": {
             "phase": row.phase,

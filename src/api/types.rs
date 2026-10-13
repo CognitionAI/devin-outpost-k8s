@@ -76,6 +76,48 @@ pub struct Spec {
     /// the worker's default is used when `None`.
     #[serde(default)]
     pub remote_binary_sha: Option<String>,
+    /// The session's effective network policy (see [`crate::network_policy`]
+    /// for how it is enforced).
+    #[serde(default)]
+    pub network_policy: NetworkPolicy,
+}
+
+/// The egress restrictions of a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPolicy {
+    /// Whether the session's network access is restricted at all. When
+    /// `false` the session is unrestricted and `allow` is empty.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The only destinations a restricted session may reach; an empty list
+    /// denies everything.
+    #[serde(default)]
+    pub allow: Vec<NetDestination>,
+}
+
+/// One destination a [`NetworkPolicy`] allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NetDestination {
+    /// A DNS name, optionally a glob in which `*` matches any run of
+    /// characters, dots included (`*.example.com` covers `a.b.example.com`
+    /// but not `example.com`).
+    Hostname {
+        /// The name or glob.
+        hostname: String,
+    },
+    /// An IPv4 address or CIDR range.
+    Ipv4 {
+        /// The address or range.
+        ipv4: String,
+    },
+    /// An IPv6 address or CIDR range.
+    Ipv6 {
+        /// The address or range.
+        ipv6: String,
+    },
+    /// A shape the server added that this client does not know about.
+    Unknown(serde_json::Value),
 }
 
 /// Observed state of a queued session.
