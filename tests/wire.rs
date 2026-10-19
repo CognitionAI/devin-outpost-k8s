@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use devin_outposts_k8s::Error;
 use devin_outposts_k8s::api::{
-    Kind, ListParams, OutpostsClient, Phase, SessionStatus, WatchEventKind,
+    Kind, ListParams, NetDestination, NetworkPolicy, OutpostsClient, Phase, SessionStatus,
+    WatchEventKind,
 };
 use futures::StreamExt;
 use mock_server::MockQueue;
@@ -237,6 +238,46 @@ async fn unknown_enum_variants_degrade_to_unknown() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].spec.kind, Kind::Unknown);
     assert_eq!(sessions[0].status.session_status, SessionStatus::Unknown);
+}
+
+#[tokio::test]
+async fn network_policy_round_trips_and_unknown_destinations_degrade() {
+    let (queue, client) = setup().await;
+    queue.enqueue("devin-open", POOL);
+    queue.enqueue("devin-restricted", POOL);
+    queue.set_network_policy(
+        "devin-restricted",
+        serde_json::json!({
+            "enabled": true,
+            "allow": [
+                {"hostname": "*.example.com"},
+                {"ipv4": "10.0.0.0/8"},
+                {"ipv6": "2001:db8::/32"},
+                {"asn": 64496},
+            ],
+        }),
+    );
+
+    let open = client.claim("devin-open").await.unwrap();
+    assert_eq!(open.spec.network_policy, NetworkPolicy::default());
+
+    let restricted = client.claim("devin-restricted").await.unwrap();
+    assert!(restricted.spec.network_policy.enabled);
+    assert_eq!(
+        restricted.spec.network_policy.allow,
+        [
+            NetDestination::Hostname {
+                hostname: "*.example.com".to_string()
+            },
+            NetDestination::Ipv4 {
+                ipv4: "10.0.0.0/8".to_string()
+            },
+            NetDestination::Ipv6 {
+                ipv6: "2001:db8::/32".to_string()
+            },
+            NetDestination::Unknown(serde_json::json!({"asn": 64496})),
+        ]
+    );
 }
 
 #[tokio::test]

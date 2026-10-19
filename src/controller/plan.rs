@@ -263,6 +263,7 @@ mod tests {
                 kind: Kind::New,
                 platform: "linux".to_string(),
                 remote_binary_sha: None,
+                network_policy: Default::default(),
             },
             status: Status {
                 phase,

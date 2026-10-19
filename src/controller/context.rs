@@ -7,6 +7,7 @@ use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 
 use crate::config::OperatorConfig;
 use crate::metrics::Metrics;
+use crate::network_policy::{Enforcement, Provider};
 
 use super::queue_watch::PoolWatchers;
 
@@ -23,6 +24,8 @@ pub struct Context {
     pub watchers: Arc<PoolWatchers>,
     /// Lazily resolved acceptor identity (see [`Context::acceptor_id`]).
     acceptor_id: Arc<tokio::sync::OnceCell<String>>,
+    /// Detected provider (see [`Context::network_policy_provider`]).
+    detected_network_policy_provider: Arc<std::sync::OnceLock<Provider>>,
 }
 
 /// Name of the `ConfigMap` persisting the generated acceptor ID.
@@ -44,7 +47,29 @@ impl Context {
             metrics,
             watchers,
             acceptor_id: Arc::default(),
+            detected_network_policy_provider: Arc::default(),
         }
+    }
+
+    /// The provider to enforce session network policies through, if any, per
+    /// [`OperatorConfig::network_policy_enforcement`]. Only a successful
+    /// detection is remembered, so enabling a provider on the cluster later
+    /// takes effect without a restart.
+    pub async fn network_policy_provider(&self) -> crate::Result<Option<Provider>> {
+        match self.config.network_policy_enforcement {
+            Enforcement::Off => return Ok(None),
+            Enforcement::Through(provider) => return Ok(Some(provider)),
+            Enforcement::Auto => {}
+        }
+        if let Some(provider) = self.detected_network_policy_provider.get() {
+            return Ok(Some(*provider));
+        }
+        let detected = Provider::detect(&self.client).await?;
+        if let Some(provider) = detected {
+            tracing::info!(?provider, "detected a network policy provider");
+            let _ = self.detected_network_policy_provider.set(provider);
+        }
+        Ok(detected)
     }
 
     /// The acceptor identity this operator claims sessions as.

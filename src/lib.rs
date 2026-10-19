@@ -17,6 +17,8 @@
 //! - [`controller`]  — the reconcile loop and per-session `Pod` template builder
 //! - [`snapshot`]    — the cloud-portable snapshot/restore provider abstraction
 //!   used to back `resume` sessions (GKE pod snapshots, filesystem, no-op).
+//! - [`network_policy`] — enforcement of each session's network policy on its
+//!   worker pod (Cilium, GKE).
 //! - [`elector`]     — Lease-based leader election
 //! - [`metrics`] / [`telemetry`] — Prometheus metrics and tracing setup.
 //! - [`config`]      — process-level runtime configuration
@@ -29,6 +31,7 @@ pub mod crd;
 pub mod elector;
 pub mod error;
 pub mod metrics;
+pub mod network_policy;
 pub mod snapshot;
 pub mod telemetry;
 

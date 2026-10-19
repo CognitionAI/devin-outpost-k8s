@@ -59,6 +59,11 @@ operator:
   # -- Default worker image when a pool does not pin one (worker.overrides.image).
   # Only the `stable` tag is supported; never pin a versioned tag.
   defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:stable"
+  # -- How session network policies are enforced: auto | off | cilium | gke.
+  # `auto` uses whichever the cluster supports and leaves sessions unrestricted
+  # when it supports neither; naming a provider makes it a requirement instead;
+  # `off` never restricts a session.
+  networkPolicyProvider: auto
   logFormat: text   # text | json
   logLevel: info
 

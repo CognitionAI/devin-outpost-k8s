@@ -52,6 +52,9 @@ spec:
               value: {{ .Values.operator.defaultWorkerImage | quote }}
             - name: ACCEPTOR_ID
               value: {{ .Values.operator.acceptorId | quote }}
+            # An unquoted `off` in a values file is a YAML boolean.
+            - name: NETWORK_POLICY_PROVIDER
+              value: {{ .Values.operator.networkPolicyProvider | toString | replace "false" "off" | quote }}
             - name: LOG_FORMAT
               value: {{ .Values.operator.logFormat | quote }}
             - name: RUST_LOG

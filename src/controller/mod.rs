@@ -9,8 +9,9 @@
 //!    with the pool's PAT and lists pending sessions.
 //! 3. Up to `maxConcurrentSessions`, it claims pending sessions; for each claim
 //!    it creates a per-session token `Secret` and an owned worker `Pod` (see
-//!    [`pod`] for the worker contract). What to do on each pass is decided by
-//!    the pure planner in [`plan`].
+//!    [`pod`] for the worker contract), restricted to the session's network
+//!    policy (see [`crate::network_policy`]). What to do on each pass is
+//!    decided by the pure planner in [`plan`].
 //! 4. The operator renews claims centrally before their deadline (claim TTL
 //!    ~5 min); worker pods never hold the pool PAT. Operator downtime longer
 //!    than the TTL returns sessions to the queue while their pods still run, so
@@ -60,11 +61,13 @@ mod reconcile;
 pub use context::Context;
 pub use plan::{Action, Observed, next_claim_deadline, plan, pod_restart_count};
 pub use pod::{
-    ANNOTATION_POOL_ID, ANNOTATION_SUSPENDED_AT, DEFAULT_WORKER_IMAGE, ENV_GATEWAY_URL,
-    ENV_REMOTE_BINARY_SHA, ENV_SESSION_TOKEN, ENV_WORKER_CACHE_DIR, LABEL_MANAGED_BY, LABEL_POOL,
-    LABEL_SESSION_ID, SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_SUBDIR,
-    WorkerPodParams, build_session_token_secret, build_state_pvc, build_worker_pod, session_labels,
-    session_token_secret_name, state_pvc_name, worker_pod_name,
+    ANNOTATION_POOL_ID, ANNOTATION_SUSPENDED_AT, DEFAULT_STATIC_BASE_URL, DEFAULT_WORKER_IMAGE,
+    ENV_GATEWAY_URL, ENV_REMOTE_BINARY_SHA, ENV_SESSION_TOKEN, ENV_STATIC_BASE_URL,
+    ENV_WORKER_CACHE_DIR, LABEL_MANAGED_BY, LABEL_NETWORK_POLICY, LABEL_POOL, LABEL_SESSION_ID,
+    SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_SUBDIR, WorkerPodParams,
+    build_session_token_secret, build_state_pvc, build_worker_pod, network_policy_name,
+    session_labels, session_token_secret_name, state_pvc_name, worker_pod_name,
+    worker_static_base_url,
 };
 pub use queue_watch::PoolWatchers;
 pub use reconcile::{error_policy, reconcile, run};

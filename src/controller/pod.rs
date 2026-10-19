@@ -36,6 +36,15 @@
 //!   per-session state dir from the cache dir's parent). The mount hides
 //!   whatever the image ships in that directory, so new volumes are cloned
 //!   from `resume.volumeDataSource` (see [`build_state_pvc`]).
+//! - The worker downloads the `devin-remote` binary from
+//!   [`ENV_STATIC_BASE_URL`], falling back to [`DEFAULT_STATIC_BASE_URL`].
+//!   The operator never sets it, but a pool's template may; either way the
+//!   worker must be able to reach that host and the gateway even when its
+//!   session's network policy doesn't list them (see
+//!   [`crate::network_policy`]). The operator can only allow a host it can
+//!   read, so a template must set it as a literal `env` `value`: a
+//!   `valueFrom` fails restricted sessions' workers, and an `envFrom` isn't
+//!   seen at all.
 
 use std::collections::BTreeMap;
 
@@ -71,6 +80,10 @@ pub const ENV_REMOTE_BINARY_SHA: &str = "DEVIN_WORKER_REMOTE_SHA";
 /// Env var redirecting the worker's binary cache (and, via its parent, the
 /// per-session state dir) under the home volume.
 pub const ENV_WORKER_CACHE_DIR: &str = "DEVIN_WORKER_CACHE_DIR";
+/// Env var the worker reads the `devin-remote` download base URL from.
+pub const ENV_STATIC_BASE_URL: &str = "DEVIN_WORKER_STATIC_BASE_URL";
+/// The worker's built-in default for [`ENV_STATIC_BASE_URL`].
+pub const DEFAULT_STATIC_BASE_URL: &str = "https://static.devin.ai/devin-rs/remote";
 /// Env var naming the worker container's home directory.
 pub const ENV_HOME: &str = "HOME";
 
@@ -90,6 +103,10 @@ pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_SESSION_ID: &str = "outposts.cognition.com/session-id";
 /// Label carrying the owning `OutpostPool`'s name on per-session objects.
 pub const LABEL_POOL: &str = "outposts.cognition.com/pool";
+/// Label naming the network policy objects (see [`network_policy_name`])
+/// that govern a worker pod; they select the pod by it. Only present on pods
+/// whose session's network policy is enforced.
+pub const LABEL_NETWORK_POLICY: &str = "outposts.cognition.com/network-policy";
 /// Annotation carrying the upstream pool ID on per-session objects.
 pub const ANNOTATION_POOL_ID: &str = "outposts.cognition.com/pool-id";
 /// Annotation recording when a per-session state volume was last suspended
@@ -110,6 +127,36 @@ pub fn session_token_secret_name(session_id: &str) -> String {
 /// (`FilesystemSnapshot` resume policy only).
 pub fn state_pvc_name(session_id: &str) -> String {
     session_object_name("outpost-state", session_id)
+}
+
+/// Deterministic name of the objects enforcing a session's network policy
+/// (see [`crate::network_policy`]).
+pub fn network_policy_name(session_id: &str) -> String {
+    session_object_name("outpost-netpol", session_id)
+}
+
+/// The base URL the pod's worker will download `devin-remote` from (see the
+/// module-level contract).
+pub fn worker_static_base_url<'a>(pod: &'a Pod, container_name: &str) -> Result<&'a str> {
+    let entry = pod
+        .spec
+        .iter()
+        .flat_map(|spec| &spec.containers)
+        .filter(|c| c.name == container_name)
+        .flat_map(|c| c.env.iter().flatten())
+        .find(|e| e.name == ENV_STATIC_BASE_URL);
+    match entry {
+        Some(EnvVar {
+            value_from: Some(_),
+            ..
+        }) => Err(Error::Config(format!(
+            "{ENV_STATIC_BASE_URL} must be a literal value for the network policy to allow its host"
+        ))),
+        Some(EnvVar {
+            value: Some(url), ..
+        }) => Ok(url),
+        _ => Ok(DEFAULT_STATIC_BASE_URL),
+    }
 }
 
 /// Derive a DNS-1123 object name from a session ID, deterministically.
@@ -162,7 +209,7 @@ fn session_annotations(pool: &OutpostPool) -> BTreeMap<String, String> {
     BTreeMap::from([(ANNOTATION_POOL_ID.to_string(), pool.spec.pool_id.clone())])
 }
 
-fn pool_owner_ref(pool: &OutpostPool) -> Result<OwnerReference> {
+pub(super) fn pool_owner_ref(pool: &OutpostPool) -> Result<OwnerReference> {
     pool.controller_owner_ref(&()).ok_or_else(|| {
         Error::Config("OutpostPool has no metadata.name/uid; cannot own objects".to_string())
     })
@@ -192,6 +239,10 @@ pub struct WorkerPodParams<'a> {
     /// restore pin). Applied after overrides: like the pod name and owner
     /// reference, they are never overridable.
     pub provider_annotations: &'a BTreeMap<String, String>,
+    /// [`network_policy_name`] of the session when its network policy is
+    /// enforced; becomes the pod's [`LABEL_NETWORK_POLICY`]. Never
+    /// overridable either: dropping the label would lift the restrictions.
+    pub network_policy_name: Option<&'a str>,
 }
 
 /// Build the per-session `Secret` holding the gateway connect token under
@@ -295,6 +346,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         default_image,
         state_pvc_name,
         provider_annotations,
+        network_policy_name,
     } = params;
     let session_id = &session.metadata.session_id;
     let worker = &pool.spec.worker;
@@ -417,6 +469,10 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
 
     let mut labels = template_meta.labels.unwrap_or_default();
     labels.extend(operator_labels);
+    labels.remove(LABEL_NETWORK_POLICY);
+    labels.extend(
+        network_policy_name.map(|name| (LABEL_NETWORK_POLICY.to_string(), name.to_string())),
+    );
     let mut annotations = template_meta.annotations.unwrap_or_default();
     annotations.extend(operator_annotations);
     annotations.extend(provider_annotations.clone());
@@ -498,6 +554,7 @@ mod tests {
                 kind: Kind::New,
                 platform: "linux".to_string(),
                 remote_binary_sha: Some("abc123".to_string()),
+                network_policy: Default::default(),
             },
             status: Status {
                 phase: Phase::Claimed,
@@ -520,6 +577,7 @@ mod tests {
             default_image: "img:default",
             state_pvc_name: None,
             provider_annotations: &NO_ANNOTATIONS,
+            network_policy_name: None,
         }
     }
 
@@ -532,6 +590,7 @@ mod tests {
                 worker_pod_name(hostile),
                 session_token_secret_name(hostile),
                 state_pvc_name(hostile),
+                network_policy_name(hostile),
             ] {
                 assert!(name.len() <= 63, "{name}");
                 assert!(
@@ -729,6 +788,72 @@ mod tests {
             pod.metadata.annotations.as_ref().unwrap()["podsnapshot.gke.io/ps-name"],
             "snap-uuid"
         );
+    }
+
+    #[test]
+    fn network_policy_label_is_operator_owned() {
+        let mut pool = pool();
+        let session = session("devin-1");
+        fn labels(p: WorkerPodParams<'_>) -> BTreeMap<String, String> {
+            build_worker_pod(p).unwrap().metadata.labels.unwrap()
+        }
+        let other_session = network_policy_name("devin-2");
+        let name = network_policy_name("devin-1");
+
+        for (template_labels, override_labels) in [
+            (BTreeMap::new(), Some(BTreeMap::new())),
+            (
+                BTreeMap::from([(LABEL_NETWORK_POLICY.to_string(), other_session.clone())]),
+                None,
+            ),
+            (
+                BTreeMap::new(),
+                Some(BTreeMap::from([(
+                    LABEL_NETWORK_POLICY.to_string(),
+                    other_session.clone(),
+                )])),
+            ),
+        ] {
+            let template = pool.spec.worker.template.metadata.get_or_insert_default();
+            template.labels = Some(template_labels);
+            pool.spec.worker.overrides.labels = override_labels;
+
+            assert!(!labels(params(&pool, &session)).contains_key(LABEL_NETWORK_POLICY));
+
+            let mut p = params(&pool, &session);
+            p.network_policy_name = Some(&name);
+            assert_eq!(labels(p)[LABEL_NETWORK_POLICY], name);
+        }
+    }
+
+    #[test]
+    fn static_base_url_follows_the_template_env() {
+        let mut pool = pool();
+        let session = session("devin-1");
+        let static_base_url = |pool: &OutpostPool| {
+            let pod = build_worker_pod(params(pool, &session)).unwrap();
+            worker_static_base_url(&pod, "devin-worker").map(str::to_string)
+        };
+        assert_eq!(static_base_url(&pool).unwrap(), DEFAULT_STATIC_BASE_URL);
+
+        let env = &mut pool.spec.worker.template.spec.as_mut().unwrap().containers[0].env;
+        *env = Some(vec![EnvVar {
+            name: ENV_STATIC_BASE_URL.to_string(),
+            value: Some("https://static.example/remote".to_string()),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            static_base_url(&pool).unwrap(),
+            "https://static.example/remote"
+        );
+
+        let env = &mut pool.spec.worker.template.spec.as_mut().unwrap().containers[0].env;
+        *env = Some(vec![EnvVar {
+            name: ENV_STATIC_BASE_URL.to_string(),
+            value_from: Some(EnvVarSource::default()),
+            ..Default::default()
+        }]);
+        assert!(matches!(static_base_url(&pool), Err(Error::Config(_))));
     }
 
     #[test]

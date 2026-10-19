@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use crate::network_policy::{Enforcement, Provider};
+
 /// Operator-wide runtime configuration, typically sourced from environment
 /// variables / flags at startup.
 #[derive(Debug, Clone)]
@@ -46,6 +48,9 @@ pub struct OperatorConfig {
     /// delete the pod. See the lifecycle mapping in [`crate::controller`].
     pub worker_restart_limit: u32,
 
+    /// Whether, and through what, session network policies are enforced.
+    pub network_policy_enforcement: Enforcement,
+
     /// Namespace this operator pod runs in. Holds operator-owned singletons:
     /// the acceptor-ID `ConfigMap` and the leader-election `Lease`.
     pub operator_namespace: String,
@@ -69,6 +74,7 @@ impl Default for OperatorConfig {
             claim_renew_margin: Duration::from_secs(60),
             acceptor_id: None,
             worker_restart_limit: 5,
+            network_policy_enforcement: Enforcement::Auto,
             operator_namespace: "default".to_string(),
             identity: "devin-outposts-k8s".to_string(),
             leader_election: true,
@@ -94,6 +100,7 @@ impl OperatorConfig {
     /// | `CLAIM_RENEW_MARGIN_SECONDS` | [`Self::claim_renew_margin`] |
     /// | `ACCEPTOR_ID` | [`Self::acceptor_id`] |
     /// | `WORKER_RESTART_LIMIT` | [`Self::worker_restart_limit`] |
+    /// | `NETWORK_POLICY_PROVIDER` (`"auto"`, `"off"`, `"cilium"` or `"gke"`) | [`Self::network_policy_enforcement`] |
     /// | `POD_NAMESPACE` (downward API) | [`Self::operator_namespace`] |
     /// | `POD_NAME` (downward API) | [`Self::identity`] |
     /// | `LEADER_ELECTION` (`"false"` to disable) | [`Self::leader_election`] |
@@ -135,6 +142,18 @@ impl OperatorConfig {
             None => defaults.worker_restart_limit,
         };
 
+        let network_policy_enforcement = match get("NETWORK_POLICY_PROVIDER").as_deref() {
+            None | Some("auto") => Enforcement::Auto,
+            Some("off") => Enforcement::Off,
+            Some("cilium") => Enforcement::Through(Provider::Cilium),
+            Some("gke") => Enforcement::Through(Provider::Gke),
+            Some(raw) => {
+                return Err(crate::Error::Config(format!(
+                    "NETWORK_POLICY_PROVIDER {raw:?}: expected auto, off, cilium or gke"
+                )));
+            }
+        };
+
         let operator_namespace = get("POD_NAMESPACE")
             .or_else(|| {
                 std::fs::read_to_string(SERVICEACCOUNT_NAMESPACE_PATH)
@@ -160,6 +179,7 @@ impl OperatorConfig {
             )?,
             acceptor_id: get("ACCEPTOR_ID"),
             worker_restart_limit,
+            network_policy_enforcement,
             operator_namespace,
             identity: get("POD_NAME").unwrap_or(defaults.identity),
             leader_election: get("LEADER_ELECTION").as_deref() != Some("false"),
@@ -184,6 +204,7 @@ mod tests {
             ("CLAIM_RENEW_MARGIN_SECONDS", "34"),
             ("ACCEPTOR_ID", "my-acceptor"),
             ("WORKER_RESTART_LIMIT", "7"),
+            ("NETWORK_POLICY_PROVIDER", "cilium"),
             ("POD_NAMESPACE", "op-ns"),
             ("POD_NAME", "op-pod-0"),
             ("LEADER_ELECTION", "false"),
@@ -204,6 +225,10 @@ mod tests {
         assert_eq!(config.claim_renew_margin, Duration::from_secs(34));
         assert_eq!(config.acceptor_id.as_deref(), Some("my-acceptor"));
         assert_eq!(config.worker_restart_limit, 7);
+        assert_eq!(
+            config.network_policy_enforcement,
+            Enforcement::Through(Provider::Cilium)
+        );
         assert_eq!(config.operator_namespace, "op-ns");
         assert_eq!(config.identity, "op-pod-0");
         assert!(!config.leader_election);
@@ -220,17 +245,26 @@ mod tests {
         assert_eq!(config.metrics_addr, defaults.metrics_addr);
         assert_eq!(config.watch_namespace, None);
         assert_eq!(config.acceptor_id, None);
+        assert_eq!(config.network_policy_enforcement, Enforcement::Auto);
         assert_eq!(config.default_api_url, defaults.default_api_url);
         assert!(config.leader_election);
 
-        // SAFETY: as above.
-        unsafe {
-            std::env::set_var("METRICS_ADDR", "not-an-addr");
+        for (key, valid, invalid) in [
+            ("METRICS_ADDR", ":8080", "not-an-addr"),
+            ("NETWORK_POLICY_PROVIDER", "off", "calico"),
+        ] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(key, invalid);
+            }
+            assert!(OperatorConfig::from_env().is_err(), "{key}={invalid}");
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(key, valid);
+            }
+            assert!(OperatorConfig::from_env().is_ok(), "{key}={valid}");
         }
-        assert!(OperatorConfig::from_env().is_err());
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("METRICS_ADDR");
-        }
+        let config = OperatorConfig::from_env().unwrap();
+        assert_eq!(config.network_policy_enforcement, Enforcement::Off);
     }
 }
