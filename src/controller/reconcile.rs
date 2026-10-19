@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Pod, Secret};
@@ -30,8 +30,10 @@ use super::pod::{
 };
 use super::queue_watch::PoolWatchers;
 
-/// Requeue delay while a snapshot is in progress or right after failures.
+/// Requeue delay while a snapshot is in progress.
 const REQUEUE_SOON: Duration = Duration::from_secs(10);
+/// How long a pool is left alone after a failed reconcile.
+const ERROR_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Run the controller until the process is asked to shut down.
 ///
@@ -81,26 +83,33 @@ pub async fn run(
 /// [`super::POOL_FINALIZER`] so pool deletion releases in-flight claims
 /// first.
 pub async fn reconcile(pool: Arc<OutpostPool>, ctx: Arc<Context>) -> crate::Result<RequeueAction> {
+    if let Some(remaining) = ctx.backoffs.remaining(&pool, Instant::now()) {
+        return Ok(RequeueAction::requeue(remaining));
+    }
     let ns = pool.namespace().unwrap_or_else(|| "default".to_string());
     let pools: Api<OutpostPool> = Api::namespaced(ctx.client.clone(), &ns);
-    finalizer(&pools, super::POOL_FINALIZER, pool, |event| async {
+    let action = finalizer(&pools, super::POOL_FINALIZER, pool.clone(), |event| async {
         match event {
             FinalizerEvent::Apply(pool) => apply(pool, &ctx).await,
             FinalizerEvent::Cleanup(pool) => cleanup(pool, &ctx).await,
         }
     })
     .await
-    .map_err(|e| Error::Other(anyhow::Error::new(e)))
+    .map_err(|e| Error::Other(anyhow::Error::new(e)))?;
+    ctx.backoffs.clear(&pool);
+    Ok(action)
 }
 
-/// Decide how to back off when [`reconcile`] returns an error.
+/// Decide how to back off when [`reconcile`] returns an error (see
+/// [`super::context::PoolBackoffs`] for how the backoff is held).
 pub fn error_policy(pool: Arc<OutpostPool>, err: &Error, ctx: Arc<Context>) -> RequeueAction {
     ctx.metrics
         .reconcile_failures
         .get_or_create(&pool_labels(&pool))
         .inc();
     warn!(pool = %pool.spec.pool_id, %err, "reconcile failed; requeueing");
-    RequeueAction::requeue(Duration::from_secs(30))
+    ctx.backoffs.start(&pool, Instant::now(), ERROR_BACKOFF);
+    RequeueAction::requeue(ERROR_BACKOFF)
 }
 
 fn pool_labels(pool: &OutpostPool) -> PoolLabels {

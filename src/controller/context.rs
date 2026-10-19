@@ -1,11 +1,14 @@
 //! Shared reconcile context handed to every reconcile invocation.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use kube::Client;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams};
+use kube::{Client, ResourceExt};
 
 use crate::config::OperatorConfig;
+use crate::crd::OutpostPool;
 use crate::metrics::Metrics;
 
 use super::queue_watch::PoolWatchers;
@@ -23,6 +26,44 @@ pub struct Context {
     pub watchers: Arc<PoolWatchers>,
     /// Lazily resolved acceptor identity (see [`Context::acceptor_id`]).
     acceptor_id: Arc<tokio::sync::OnceCell<String>>,
+    /// Pools backing off after a failed reconcile.
+    pub backoffs: Arc<PoolBackoffs>,
+}
+
+/// When failed pools may be reconciled again.
+///
+/// The controller's own backoff only delays the requeue it schedules; queue
+/// events still trigger reconciles immediately. A failure after a claim
+/// therefore loops hot, since the claim itself is a queue event. So a pool
+/// stays untouched until its backoff ends or its spec changes (a changed
+/// spec may be the fix).
+#[derive(Default)]
+pub struct PoolBackoffs(Mutex<HashMap<String, (Option<i64>, Instant)>>);
+
+impl PoolBackoffs {
+    /// Back `pool` off until `delay` after `now`.
+    pub fn start(&self, pool: &OutpostPool, now: Instant, delay: Duration) {
+        let mut backoffs = self.0.lock().expect("not poisoned");
+        backoffs.insert(
+            pool.uid().unwrap_or_default(),
+            (pool.metadata.generation, now + delay),
+        );
+    }
+
+    /// How long `pool` is still backing off for at `now`, if at all.
+    pub fn remaining(&self, pool: &OutpostPool, now: Instant) -> Option<Duration> {
+        let backoffs = self.0.lock().expect("not poisoned");
+        let (generation, until) = backoffs.get(&pool.uid().unwrap_or_default())?;
+        (*generation == pool.metadata.generation)
+            .then(|| until.saturating_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    /// End `pool`'s backoff.
+    pub fn clear(&self, pool: &OutpostPool) {
+        let mut backoffs = self.0.lock().expect("not poisoned");
+        backoffs.remove(&pool.uid().unwrap_or_default());
+    }
 }
 
 /// Name of the `ConfigMap` persisting the generated acceptor ID.
@@ -44,6 +85,7 @@ impl Context {
             metrics,
             watchers,
             acceptor_id: Arc::default(),
+            backoffs: Arc::default(),
         }
     }
 
@@ -101,5 +143,53 @@ impl Context {
             })
             .await?;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::crd::{OutpostPoolSpec, SecretKeyRef};
+
+    use super::*;
+
+    fn pool(uid: &str, generation: i64) -> OutpostPool {
+        let mut pool = OutpostPool::new(
+            "my-pool",
+            OutpostPoolSpec {
+                pool_id: "pool_x".to_string(),
+                token_secret_ref: SecretKeyRef {
+                    name: "tok".to_string(),
+                    key: "token".to_string(),
+                },
+                api_url: None,
+                max_concurrent_sessions: 10,
+                worker: serde_json::from_value(serde_json::json!({})).unwrap(),
+                resume: Default::default(),
+            },
+        );
+        pool.metadata.uid = Some(uid.to_string());
+        pool.metadata.generation = Some(generation);
+        pool
+    }
+
+    #[test]
+    fn backoff_holds_until_it_ends_the_spec_changes_or_it_is_cleared() {
+        let backoffs = PoolBackoffs::default();
+        let now = Instant::now();
+        let delay = Duration::from_secs(30);
+        assert_eq!(backoffs.remaining(&pool("a", 1), now), None);
+
+        backoffs.start(&pool("a", 1), now, delay);
+        let later = now + Duration::from_secs(10);
+        assert_eq!(
+            backoffs.remaining(&pool("a", 1), later),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(backoffs.remaining(&pool("b", 1), later), None);
+        assert_eq!(backoffs.remaining(&pool("a", 2), later), None);
+        assert_eq!(backoffs.remaining(&pool("a", 1), now + delay), None);
+
+        backoffs.clear(&pool("a", 1));
+        assert_eq!(backoffs.remaining(&pool("a", 1), later), None);
     }
 }
