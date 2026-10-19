@@ -83,23 +83,25 @@ pub enum Provider {
 impl Provider {
     /// The provider this cluster can enforce through, if any.
     pub async fn detect(client: &Client) -> Result<Option<Self>> {
-        let groups = client.list_api_groups().await?.groups;
-        // GKE's dataplane is Cilium underneath and can serve `cilium.io`
-        // kinds, but GKE only supports hostname rules through its own kind.
-        let (provider, required) = if groups.iter().any(|g| g.name == gke::GROUP) {
-            (Self::Gke, gke::fqdn_policy())
-        } else {
-            (Self::Cilium, cilium::policy())
-        };
-        let served = match client.list_api_group_resources(&required.api_version).await {
-            Ok(list) => list.resources,
-            Err(kube::Error::Api(e)) if e.code == 404 => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(served
-            .iter()
-            .any(|r| r.kind == required.kind)
-            .then_some(provider))
+        // GKE's dataplane is Cilium underneath, but GKE only supports
+        // hostname rules through its own kind, so that one is asked for
+        // first. Each kind is served only once its provider enforces it:
+        // GKE installs its kind when FQDN network policy is enabled, and
+        // Dataplane V2 doesn't serve Cilium's.
+        for (provider, required) in [
+            (Self::Gke, gke::fqdn_policy()),
+            (Self::Cilium, cilium::policy()),
+        ] {
+            let served = match client.list_api_group_resources(&required.api_version).await {
+                Ok(list) => list.resources,
+                Err(kube::Error::Api(e)) if e.code == 404 => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if served.iter().any(|r| r.kind == required.kind) {
+                return Ok(Some(provider));
+            }
+        }
+        Ok(None)
     }
 
     /// The kinds, and their `spec`s, that restrict the pods `selector`
@@ -360,7 +362,13 @@ mod tests {
         let manifests = Provider::Cilium.manifests(&selector(), &Egress::default());
         let rules = manifests[0].1["egress"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
-        assert!(rules[0].get("toEndpoints").is_some());
+        let dns_servers: Vec<&Value> = rules[0]["toEndpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|selector| &selector["matchLabels"]["k8s:k8s-app"])
+            .collect();
+        assert_eq!(dns_servers, ["kube-dns", "node-local-dns"]);
     }
 
     #[test]

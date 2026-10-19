@@ -19,10 +19,20 @@ pub(super) fn manifests(selector: &Value, egress: &Egress) -> Vec<(ApiResource, 
     // Routing lookups through Cilium's DNS proxy is also how it learns which
     // addresses the `toFQDNs` names currently stand for.
     let mut rules = vec![json!({
-        "toEndpoints": [{"matchLabels": {
-            "k8s:io.kubernetes.pod.namespace": "kube-system",
-            "k8s:k8s-app": "kube-dns",
-        }}],
+        "toEndpoints": [
+            {"matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "kube-system",
+                "k8s:k8s-app": "kube-dns",
+            }},
+            // NodeLocal DNSCache as Cilium deploys it: pods behind a local
+            // redirect of the kube-dns service, which policy sees as the
+            // destination instead of kube-dns
+            // (<https://docs.cilium.io/en/stable/network/kubernetes/local-redirect-policy/#node-local-dns-cache>).
+            {"matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "kube-system",
+                "k8s:k8s-app": "node-local-dns",
+            }},
+        ],
         "toPorts": [{
             "ports": [{"port": "53", "protocol": "ANY"}],
             "rules": {"dns": [{"matchPattern": "*"}]},

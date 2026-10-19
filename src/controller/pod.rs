@@ -41,7 +41,10 @@
 //!   The operator never sets it, but a pool's template may; either way the
 //!   worker must be able to reach that host and the gateway even when its
 //!   session's network policy doesn't list them (see
-//!   [`crate::network_policy`]).
+//!   [`crate::network_policy`]). The operator can only allow a host it can
+//!   read, so a template must set it as a literal `env` `value`: a
+//!   `valueFrom` fails restricted sessions' workers, and an `envFrom` isn't
+//!   seen at all.
 
 use std::collections::BTreeMap;
 
@@ -134,15 +137,26 @@ pub fn network_policy_name(session_id: &str) -> String {
 
 /// The base URL the pod's worker will download `devin-remote` from (see the
 /// module-level contract).
-pub fn worker_static_base_url<'a>(pod: &'a Pod, container_name: &str) -> &'a str {
-    pod.spec
+pub fn worker_static_base_url<'a>(pod: &'a Pod, container_name: &str) -> Result<&'a str> {
+    let entry = pod
+        .spec
         .iter()
         .flat_map(|spec| &spec.containers)
         .filter(|c| c.name == container_name)
         .flat_map(|c| c.env.iter().flatten())
-        .find(|e| e.name == ENV_STATIC_BASE_URL)
-        .and_then(|e| e.value.as_deref())
-        .unwrap_or(DEFAULT_STATIC_BASE_URL)
+        .find(|e| e.name == ENV_STATIC_BASE_URL);
+    match entry {
+        Some(EnvVar {
+            value_from: Some(_),
+            ..
+        }) => Err(Error::Config(format!(
+            "{ENV_STATIC_BASE_URL} must be a literal value for the network policy to allow its host"
+        ))),
+        Some(EnvVar {
+            value: Some(url), ..
+        }) => Ok(url),
+        _ => Ok(DEFAULT_STATIC_BASE_URL),
+    }
 }
 
 /// Derive a DNS-1123 object name from a session ID, deterministically.
@@ -455,6 +469,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
 
     let mut labels = template_meta.labels.unwrap_or_default();
     labels.extend(operator_labels);
+    labels.remove(LABEL_NETWORK_POLICY);
     labels.extend(
         network_policy_name.map(|name| (LABEL_NETWORK_POLICY.to_string(), name.to_string())),
     );
@@ -776,40 +791,69 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_label_survives_override_replacement() {
+    fn network_policy_label_is_operator_owned() {
         let mut pool = pool();
-        pool.spec.worker.overrides.labels = Some(BTreeMap::new());
         let session = session("devin-1");
-        let labels = |p| build_worker_pod(p).unwrap().metadata.labels.unwrap();
-
-        assert!(!labels(params(&pool, &session)).contains_key(LABEL_NETWORK_POLICY));
-
+        fn labels(p: WorkerPodParams<'_>) -> BTreeMap<String, String> {
+            build_worker_pod(p).unwrap().metadata.labels.unwrap()
+        }
+        let other_session = network_policy_name("devin-2");
         let name = network_policy_name("devin-1");
-        let mut p = params(&pool, &session);
-        p.network_policy_name = Some(&name);
-        assert_eq!(labels(p)[LABEL_NETWORK_POLICY], name);
+
+        for (template_labels, override_labels) in [
+            (BTreeMap::new(), Some(BTreeMap::new())),
+            (
+                BTreeMap::from([(LABEL_NETWORK_POLICY.to_string(), other_session.clone())]),
+                None,
+            ),
+            (
+                BTreeMap::new(),
+                Some(BTreeMap::from([(
+                    LABEL_NETWORK_POLICY.to_string(),
+                    other_session.clone(),
+                )])),
+            ),
+        ] {
+            let template = pool.spec.worker.template.metadata.get_or_insert_default();
+            template.labels = Some(template_labels);
+            pool.spec.worker.overrides.labels = override_labels;
+
+            assert!(!labels(params(&pool, &session)).contains_key(LABEL_NETWORK_POLICY));
+
+            let mut p = params(&pool, &session);
+            p.network_policy_name = Some(&name);
+            assert_eq!(labels(p)[LABEL_NETWORK_POLICY], name);
+        }
     }
 
     #[test]
     fn static_base_url_follows_the_template_env() {
         let mut pool = pool();
         let session = session("devin-1");
-        let pod = build_worker_pod(params(&pool, &session)).unwrap();
-        assert_eq!(
-            worker_static_base_url(&pod, "devin-worker"),
-            DEFAULT_STATIC_BASE_URL
-        );
+        let static_base_url = |pool: &OutpostPool| {
+            let pod = build_worker_pod(params(pool, &session)).unwrap();
+            worker_static_base_url(&pod, "devin-worker").map(str::to_string)
+        };
+        assert_eq!(static_base_url(&pool).unwrap(), DEFAULT_STATIC_BASE_URL);
 
-        pool.spec.worker.template.spec.as_mut().unwrap().containers[0].env = Some(vec![EnvVar {
+        let env = &mut pool.spec.worker.template.spec.as_mut().unwrap().containers[0].env;
+        *env = Some(vec![EnvVar {
             name: ENV_STATIC_BASE_URL.to_string(),
             value: Some("https://static.example/remote".to_string()),
             ..Default::default()
         }]);
-        let pod = build_worker_pod(params(&pool, &session)).unwrap();
         assert_eq!(
-            worker_static_base_url(&pod, "devin-worker"),
+            static_base_url(&pool).unwrap(),
             "https://static.example/remote"
         );
+
+        let env = &mut pool.spec.worker.template.spec.as_mut().unwrap().containers[0].env;
+        *env = Some(vec![EnvVar {
+            name: ENV_STATIC_BASE_URL.to_string(),
+            value_from: Some(EnvVarSource::default()),
+            ..Default::default()
+        }]);
+        assert!(matches!(static_base_url(&pool), Err(Error::Config(_))));
     }
 
     #[test]

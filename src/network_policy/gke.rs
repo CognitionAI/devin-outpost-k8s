@@ -14,11 +14,8 @@ use serde_json::{Value, json};
 
 use super::Egress;
 
-/// API group only GKE clusters serve.
-pub(super) const GROUP: &str = "networking.gke.io";
-
 pub(super) fn fqdn_policy() -> ApiResource {
-    let gvk = GroupVersionKind::gvk(GROUP, "v1alpha1", "FQDNNetworkPolicy");
+    let gvk = GroupVersionKind::gvk("networking.gke.io", "v1alpha1", "FQDNNetworkPolicy");
     ApiResource::from_gvk_with_plural(&gvk, "fqdnnetworkpolicies")
 }
 

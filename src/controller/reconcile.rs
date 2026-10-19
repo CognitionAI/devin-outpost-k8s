@@ -535,12 +535,18 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         network_policy_name: policy_name.as_deref(),
     })?;
 
-    let static_base_url = worker_static_base_url(&pod, &sync.pool.spec.worker.container_name);
-    let allow = [
-        network_policy.allow.clone(),
-        worker_infrastructure(gateway_url, static_base_url),
-    ]
-    .concat();
+    let allow = match enforced_through {
+        Some(_) => {
+            let static_base_url =
+                worker_static_base_url(&pod, &sync.pool.spec.worker.container_name)?;
+            [
+                network_policy.allow.clone(),
+                worker_infrastructure(gateway_url, static_base_url),
+            ]
+            .concat()
+        }
+        None => Vec::new(),
+    };
     let session_policy = enforced_through.map(|provider| SessionPolicy {
         provider,
         pool: sync.pool,
