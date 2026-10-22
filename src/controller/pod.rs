@@ -45,13 +45,28 @@
 //!   read, so a template must set it as a literal `env` `value`: a
 //!   `valueFrom` fails restricted sessions' workers, and an `envFrom` isn't
 //!   seen at all.
+//! - When the queue item carries `spec.image` the worker container runs that
+//!   image instead of the pool's: it is the session's DRS build, so it wins
+//!   even over `worker.overrides.image`. Such an image must honour the same
+//!   contract as the pool's worker image. With a state volume, the volume
+//!   starts empty and [`SEED_HOME_CONTAINER_NAME`] fills it from the image's
+//!   own home directory, so `resume.volumeDataSource` is not used.
+//! - When the queue item carries `spec.image_build` the pod is a DRS build:
+//!   the worker gets `allowPrivilegeEscalation` (the capture reads the whole
+//!   filesystem through `sudo`) and a directory shared with
+//!   [`PUSH_SIDECAR_CONTAINER_NAME`], a native sidecar running this
+//!   operator's image (`push-layer`, see [`crate::image_push`]) as root,
+//!   with the pool's registry credential, the base image and
+//!   `spec.image_target`; it pushes what the capture puts in the directory.
+//!   The worker, where the customer's blueprints run with sudo, never sees
+//!   the credential or the target.
 
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, Pod, PodSpec, Secret, SecretKeySelector, Volume,
-    VolumeMount, VolumeResourceRequirements,
+    Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod, PodSpec, Secret,
+    SecretKeySelector, SecurityContext, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -60,6 +75,7 @@ use kube::Resource;
 use crate::api::OutpostDevin;
 use crate::crd::{OutpostPool, ResumeConfig};
 use crate::error::{Error, Result};
+use crate::image_push;
 
 /// Default worker image used when a pool's `worker.overrides.image` is unset.
 ///
@@ -86,6 +102,9 @@ pub const ENV_STATIC_BASE_URL: &str = "DEVIN_WORKER_STATIC_BASE_URL";
 pub const DEFAULT_STATIC_BASE_URL: &str = "https://static.devin.ai/devin-rs/remote";
 /// Env var naming the worker container's home directory.
 pub const ENV_HOME: &str = "HOME";
+/// Push sidecar of an image-build pod (see [`crate::image_push`]).
+pub const PUSH_SIDECAR_CONTAINER_NAME: &str = "devin-image-push";
+const LAYER_VOLUME_NAME: &str = "drs-layer";
 
 /// Subdirectory of the home volume holding the worker's binary cache and
 /// per-session state dir.
@@ -93,6 +112,16 @@ pub const WORKER_DATA_SUBDIR: &str = ".devin-worker";
 
 /// Name of the per-session state volume in the pod spec.
 const STATE_VOLUME_NAME: &str = "outpost-state";
+/// Init container that copies the session image's home directory onto an
+/// empty state volume.
+pub const SEED_HOME_CONTAINER_NAME: &str = "devin-seed-home";
+/// Where [`SEED_HOME_CONTAINER_NAME`] mounts the state volume: not the home
+/// directory, which it has to read from the image.
+const SEED_HOME_MOUNT_PATH: &str = "/mnt/outpost-state";
+/// File on the state volume, relative to its root, recording that the copy
+/// finished. A resume, or a retry after a crash mid-copy, must not overwrite a
+/// home the session has already changed.
+const SEED_HOME_MARKER: &str = ".devin-worker/home-seeded";
 
 /// Key under which the connect token is stored in the per-session `Secret`.
 pub const SESSION_TOKEN_SECRET_KEY: &str = "token";
@@ -243,6 +272,9 @@ pub struct WorkerPodParams<'a> {
     /// enforced; becomes the pod's [`LABEL_NETWORK_POLICY`]. Never
     /// overridable either: dropping the label would lift the restrictions.
     pub network_policy_name: Option<&'a str>,
+    /// This operator's image, run as the push sidecar of image-build pods
+    /// (see [`crate::config::OperatorConfig::operator_image`]).
+    pub operator_image: Option<&'a str>,
 }
 
 /// Build the per-session `Secret` holding the gateway connect token under
@@ -280,17 +312,26 @@ pub fn build_session_token_secret(
 /// `FilesystemSnapshot` resume policy (see [`crate::snapshot`] for when it is
 /// created, retained and deleted). It is cloned from `resume.volumeDataSource`
 /// rather than created empty: the volume becomes the worker's home directory,
-/// and an empty one would hide everything the image ships there.
+/// and an empty one would hide everything the image ships there. A session
+/// with its own image (`spec.image`) is the exception: its volume is created
+/// empty and seeded from that image by the worker pod, because the pool's
+/// data source holds the home of a different image.
 pub fn build_state_pvc(
     pool: &OutpostPool,
-    session_id: &str,
+    session: &OutpostDevin,
     resume: &ResumeConfig,
 ) -> Result<PersistentVolumeClaim> {
-    let data_source = resume.volume_data_source.clone().ok_or_else(|| {
-        Error::Config(
-            "resume.volumeDataSource is required for the FilesystemSnapshot policy".to_string(),
-        )
-    })?;
+    let session_id = &session.metadata.session_id;
+    let data_source = match &session.spec.image {
+        Some(_) => None,
+        None => Some(resume.volume_data_source.clone().ok_or_else(|| {
+            Error::Config(
+                "resume.volumeDataSource is required for the FilesystemSnapshot policy \
+                 when the session carries no image"
+                    .to_string(),
+            )
+        })?),
+    };
     let size = resume
         .volume_size
         .clone()
@@ -307,13 +348,133 @@ pub fn build_state_pvc(
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".to_string()]),
             storage_class_name: resume.storage_class_name.clone(),
-            data_source: Some(data_source),
+            data_source,
             resources: Some(VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([("storage".to_string(), Quantity(size))])),
                 ..Default::default()
             }),
             ..Default::default()
         }),
+        ..Default::default()
+    })
+}
+
+/// Init container that fills an empty state volume with the home directory
+/// `image` ships. It runs as root so the copy keeps the image's ownership on
+/// a freshly provisioned, root-owned volume.
+fn seed_home_container(image: &str, home_dir: &str) -> Container {
+    let script = format!(
+        "[ -e \"$SEED/{SEED_HOME_MARKER}\" ] || {{ cp -a \"$IMAGE_HOME/.\" \"$SEED/\" \
+         && mkdir -p \"$(dirname \"$SEED/{SEED_HOME_MARKER}\")\" \
+         && touch \"$SEED/{SEED_HOME_MARKER}\"; }}"
+    );
+    Container {
+        name: SEED_HOME_CONTAINER_NAME.to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+        env: Some(vec![
+            EnvVar {
+                name: "IMAGE_HOME".to_string(),
+                value: Some(home_dir.to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "SEED".to_string(),
+                value: Some(SEED_HOME_MOUNT_PATH.to_string()),
+                ..Default::default()
+            },
+        ]),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            ..Default::default()
+        }),
+        volume_mounts: Some(vec![VolumeMount {
+            name: STATE_VOLUME_NAME.to_string(),
+            mount_path: SEED_HOME_MOUNT_PATH.to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+fn layer_volume_mount() -> VolumeMount {
+    VolumeMount {
+        name: LAYER_VOLUME_NAME.to_string(),
+        mount_path: image_push::LAYER_DIR.to_string(),
+        ..Default::default()
+    }
+}
+
+/// The push sidecar of an image-build pod: the operator image running
+/// [`image_push::SUBCOMMAND`] with the registry settings the worker must not
+/// have. A native sidecar (`restartPolicy: Always` on an init container,
+/// Kubernetes 1.29+): up before the worker starts, stopped when the worker
+/// exits, so it never holds the pod open. Root, to close the shared
+/// directory to the worker's box user and still read what the capture, also
+/// root, writes.
+fn push_sidecar_container(
+    config: &crate::crd::ImageBuildConfig,
+    session: &OutpostDevin,
+    operator_image: Option<&str>,
+    base_image: &str,
+) -> Result<Container> {
+    let operator_image = operator_image.ok_or_else(|| {
+        Error::Config(
+            "OPERATOR_IMAGE is not set on the operator; image-build sessions need it \
+             for their push sidecar"
+                .to_string(),
+        )
+    })?;
+    let target = session.spec.image_target.as_deref().ok_or_else(|| {
+        Error::Config(format!(
+            "image-build session {} has no image_target",
+            session.metadata.session_id
+        ))
+    })?;
+    let value = |name: &str, value: &str| EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        ..Default::default()
+    };
+    let mut env = vec![
+        value(image_push::ENV_LAYER_DIR, image_push::LAYER_DIR),
+        value(image_push::ENV_BASE_IMAGE, base_image),
+        value(image_push::ENV_TARGET, target),
+    ];
+    if config.insecure_registry {
+        env.push(value(image_push::ENV_REGISTRY_INSECURE, "1"));
+    }
+    if let Some(secret) = &config.registry_secret_name {
+        for (name, key) in [
+            (image_push::ENV_REGISTRY_USERNAME, "username"),
+            (image_push::ENV_REGISTRY_PASSWORD, "password"),
+        ] {
+            env.push(EnvVar {
+                name: name.to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: secret.clone(),
+                        key: key.to_string(),
+                        optional: Some(false),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    Ok(Container {
+        name: PUSH_SIDECAR_CONTAINER_NAME.to_string(),
+        image: Some(operator_image.to_string()),
+        args: Some(vec![image_push::SUBCOMMAND.to_string()]),
+        restart_policy: Some("Always".to_string()),
+        env: Some(env),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            run_as_non_root: Some(false),
+            ..Default::default()
+        }),
+        volume_mounts: Some(vec![layer_volume_mount()]),
         ..Default::default()
     })
 }
@@ -332,9 +493,10 @@ pub fn build_state_pvc(
 ///    `image` to `default_image`, its command/args and env per the module-level
 ///    contract. Set `restartPolicy = OnFailure` (see the lifecycle mapping in
 ///    [`crate::controller`]), and attach a deterministic pod name, identifying
-///    labels/annotations, and an owner reference to the pool for GC.
+///    labels/annotations, and an owner reference to the pool for GC. A
+///    session image (`spec.image`) replaces `default_image`.
 /// 3. **Overrides:** apply `worker.overrides`. Each `Some` field wins over the
-///    layer-2 value: `image`, `command`, `args`, `restart_policy`, and the pod
+///    layer-2 value: `image` (unless the session carries its own), `command`, `args`, `restart_policy`, and the pod
 ///    `labels`/`annotations` (which *replace* the operator's merged set). The
 ///    pod name and owner reference stay operator-owned and are never overridden.
 pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
@@ -347,6 +509,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         state_pvc_name,
         provider_annotations,
         network_policy_name,
+        operator_image,
     } = params;
     let session_id = &session.metadata.session_id;
     let worker = &pool.spec.worker;
@@ -373,7 +536,8 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         }
     };
 
-    container.image = Some(default_image.to_string());
+    let image = session.spec.image.as_deref().unwrap_or(default_image);
+    container.image = Some(image.to_string());
     container.command = Some(vec![WORKER_COMMAND.to_string()]);
     container.args = Some(vec![
         "worker".to_string(),
@@ -437,15 +601,52 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
             ..Default::default()
         });
     }
+    if session.spec.image_build {
+        let config = pool.spec.image_build.clone().unwrap_or_default();
+        let base_image = config
+            .base_image
+            .as_deref()
+            .or(overrides.image.as_deref())
+            .unwrap_or(default_image);
+        let sidecar = push_sidecar_container(&config, session, operator_image, base_image)?;
+        operator_env.push(EnvVar {
+            name: image_push::ENV_LAYER_DIR.to_string(),
+            value: Some(image_push::LAYER_DIR.to_string()),
+            ..Default::default()
+        });
+        container
+            .volume_mounts
+            .get_or_insert_default()
+            .push(layer_volume_mount());
+        // The capture reads the whole filesystem, which takes sudo.
+        container
+            .security_context
+            .get_or_insert_default()
+            .allow_privilege_escalation = Some(true);
+        spec.volumes.get_or_insert_default().push(Volume {
+            name: LAYER_VOLUME_NAME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        spec.init_containers.get_or_insert_default().push(sidecar);
+    }
     let env = container.env.get_or_insert_default();
     env.retain(|e| operator_env.iter().all(|o| o.name != e.name));
     env.extend(operator_env);
+
+    if let (Some(image), Some(_)) = (&session.spec.image, state_pvc_name) {
+        spec.init_containers
+            .get_or_insert_default()
+            .push(seed_home_container(image, pool.spec.resume.home_dir()));
+    }
 
     spec.restart_policy = Some("OnFailure".to_string());
 
     // Layer 3: pool overrides win over layer 2 (but never over the pod name
     // or owner reference).
-    if let Some(image) = &overrides.image {
+    if let Some(image) = &overrides.image
+        && session.spec.image.is_none()
+    {
         container.image = Some(image.clone());
     }
     if let Some(command) = &overrides.command {
@@ -535,6 +736,7 @@ mod tests {
                     overrides: WorkerOverrides::default(),
                 },
                 resume: Default::default(),
+                image_build: None,
             },
         );
         pool.metadata.namespace = Some("ns".to_string());
@@ -555,6 +757,9 @@ mod tests {
                 platform: "linux".to_string(),
                 remote_binary_sha: Some("abc123".to_string()),
                 network_policy: Default::default(),
+                image: None,
+                image_build: false,
+                image_target: None,
             },
             status: Status {
                 phase: Phase::Claimed,
@@ -578,6 +783,7 @@ mod tests {
             state_pvc_name: None,
             provider_annotations: &NO_ANNOTATIONS,
             network_policy_name: None,
+            operator_image: Some("ghcr.io/cognitionai/devin-outposts-k8s:sha-1"),
         }
     }
 
@@ -655,6 +861,90 @@ mod tests {
         let owner = &pod.metadata.owner_references.as_ref().unwrap()[0];
         assert_eq!(owner.uid, "uid-123");
         assert_eq!(owner.controller, Some(true));
+    }
+
+    #[test]
+    fn only_an_image_build_pod_gets_a_push_sidecar_and_the_worker_never_the_credential() {
+        fn drs_env(container: &Container) -> BTreeMap<&str, &EnvVar> {
+            container
+                .env
+                .iter()
+                .flatten()
+                .filter(|e| e.name.starts_with("DEVIN_DRS_"))
+                .map(|e| (e.name.as_str(), e))
+                .collect()
+        }
+        let mut pool = pool();
+        pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
+            registry_secret_name: Some("registry-push".to_string()),
+            ..Default::default()
+        });
+        let pod = build_worker_pod(params(&pool, &session("devin-agent"))).unwrap();
+        let agent = pod.spec.unwrap();
+        assert!(agent.init_containers.is_none());
+        assert!(drs_env(&agent.containers[0]).is_empty());
+
+        let mut build = session("devin-build");
+        build.spec.image_build = true;
+        // The target is the control plane's; without it the pod is refused.
+        let err = build_worker_pod(params(&pool, &build)).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        build.spec.image_target = Some("reg.example/devin/drs/org-1:job-1".to_string());
+        let pod = build_worker_pod(params(&pool, &build)).unwrap();
+        let spec = pod.spec.unwrap();
+        let worker = &spec.containers[0];
+        let worker_env = drs_env(worker);
+        // The worker knows the shared directory and nothing else.
+        assert_eq!(
+            worker_env.keys().copied().collect::<Vec<_>>(),
+            [image_push::ENV_LAYER_DIR]
+        );
+
+        // The sidecar is the operator image, as root, with everything else.
+        let sidecar = &spec.init_containers.as_ref().unwrap()[0];
+        let operator_image = params(&pool, &build).operator_image;
+        assert_eq!(sidecar.image.as_deref(), operator_image);
+        assert_eq!(sidecar.restart_policy.as_deref(), Some("Always"));
+        let sidecar_env = drs_env(sidecar);
+        assert_eq!(
+            sidecar_env[image_push::ENV_TARGET].value,
+            build.spec.image_target
+        );
+        for (name, key) in [
+            (image_push::ENV_REGISTRY_USERNAME, "username"),
+            (image_push::ENV_REGISTRY_PASSWORD, "password"),
+        ] {
+            let source = sidecar_env[name].value_from.as_ref().unwrap();
+            let secret = source.secret_key_ref.as_ref().unwrap();
+            assert_eq!(
+                (secret.name.as_str(), secret.key.as_str()),
+                ("registry-push", key)
+            );
+        }
+
+        // Both mount the same emptyDir at the path the env var names.
+        let shared = &sidecar.volume_mounts.as_ref().unwrap()[0];
+        assert!(worker.volume_mounts.as_ref().unwrap().contains(shared));
+        for env in [&worker_env, &sidecar_env] {
+            assert_eq!(
+                env[image_push::ENV_LAYER_DIR].value.as_deref(),
+                Some(shared.mount_path.as_str())
+            );
+        }
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|v| v.name == shared.name && v.empty_dir.is_some())
+        );
+
+        // No operator image, no sidecar, no build.
+        let err = build_worker_pod(WorkerPodParams {
+            operator_image: None,
+            ..params(&pool, &build)
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
     }
 
     #[test]
@@ -897,7 +1187,7 @@ mod tests {
     #[test]
     fn state_pvc_uses_configured_size_and_class() {
         let pool = pool();
-        let pvc = build_state_pvc(&pool, "devin-1", &golden_resume()).unwrap();
+        let pvc = build_state_pvc(&pool, &session("devin-1"), &golden_resume()).unwrap();
         let spec = pvc.spec.as_ref().unwrap();
         assert_eq!(
             spec.resources.as_ref().unwrap().requests.as_ref().unwrap()["storage"].0,
@@ -910,7 +1200,7 @@ mod tests {
             storage_class_name: Some("fast".to_string()),
             ..golden_resume()
         };
-        let pvc = build_state_pvc(&pool, "devin-1", &resume).unwrap();
+        let pvc = build_state_pvc(&pool, &session("devin-1"), &resume).unwrap();
         let spec = pvc.spec.as_ref().unwrap();
         assert_eq!(
             spec.resources.as_ref().unwrap().requests.as_ref().unwrap()["storage"].0,
@@ -933,11 +1223,66 @@ mod tests {
     #[test]
     fn state_pvc_requires_and_clones_the_data_source() {
         let pool = pool();
-        let err = build_state_pvc(&pool, "devin-1", &Default::default()).unwrap_err();
+        let err = build_state_pvc(&pool, &session("devin-1"), &Default::default()).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
 
         let resume = golden_resume();
-        let pvc = build_state_pvc(&pool, "devin-1", &resume).unwrap();
+        let pvc = build_state_pvc(&pool, &session("devin-1"), &resume).unwrap();
         assert_eq!(pvc.spec.unwrap().data_source, resume.volume_data_source);
+    }
+
+    #[test]
+    fn session_image_wins_over_the_pool_image_and_seeds_its_own_home() {
+        let mut pool = pool();
+        pool.spec.worker.overrides.image = Some("img:pool".to_string());
+        let mut session = session("devin-1");
+        session.spec.image = Some("reg/drs@sha256:abc".to_string());
+
+        // No golden volume: the state volume starts empty.
+        let pvc = build_state_pvc(&pool, &session, &Default::default()).unwrap();
+        assert_eq!(pvc.spec.unwrap().data_source, None);
+
+        let pod = build_worker_pod(WorkerPodParams {
+            state_pvc_name: Some("pvc-x"),
+            ..params(&pool, &session)
+        })
+        .unwrap();
+        let spec = pod.spec.unwrap();
+        let worker = spec
+            .containers
+            .iter()
+            .find(|c| c.name == "devin-worker")
+            .unwrap();
+        assert_eq!(worker.image.as_deref(), Some("reg/drs@sha256:abc"));
+
+        // The seed runs the session image and writes to the volume the worker
+        // mounts as home, at a path that leaves the image's home readable.
+        let seed = &spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(seed.image.as_deref(), Some("reg/drs@sha256:abc"));
+        let seed_mount = &seed.volume_mounts.as_ref().unwrap()[0];
+        let home_mount = worker
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mount_path == "/home/ubuntu")
+            .unwrap();
+        assert_eq!(seed_mount.name, home_mount.name);
+        assert_ne!(seed_mount.mount_path, home_mount.mount_path);
+
+        // Without a session image the pool's own image and no seed.
+        session.spec.image = None;
+        let pod = build_worker_pod(params(&pool, &session)).unwrap();
+        let spec = pod.spec.unwrap();
+        assert_eq!(
+            spec.containers
+                .iter()
+                .find(|c| c.name == "devin-worker")
+                .unwrap()
+                .image
+                .as_deref(),
+            Some("img:pool")
+        );
+        assert!(spec.init_containers.is_none());
     }
 }

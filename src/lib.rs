@@ -30,6 +30,7 @@ pub mod controller;
 pub mod crd;
 pub mod elector;
 pub mod error;
+pub mod image_push;
 pub mod metrics;
 pub mod network_policy;
 pub mod snapshot;

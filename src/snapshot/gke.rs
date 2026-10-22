@@ -35,6 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+
+use crate::api::OutpostDevin;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch,
@@ -200,7 +202,8 @@ impl SnapshotProvider for GkeSnapshotProvider {
     /// [`Self::verify_restore`] can tell a cold start from success. No
     /// per-session state volume is needed — the checkpoint carries the
     /// filesystem.
-    async fn prepare(&self, session_id: &str) -> Result<PreparedSession> {
+    async fn prepare(&self, session: &OutpostDevin) -> Result<PreparedSession> {
+        let session_id = &session.metadata.session_id;
         let storage_config = self
             .pool
             .spec
@@ -462,6 +465,7 @@ mod tests {
                     overrides: Default::default(),
                 },
                 resume: Default::default(),
+                image_build: None,
             },
         );
         GkeSnapshotProvider::new(

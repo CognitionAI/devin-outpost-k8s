@@ -264,6 +264,9 @@ mod tests {
                 platform: "linux".to_string(),
                 remote_binary_sha: None,
                 network_policy: Default::default(),
+                image: None,
+                image_build: false,
+                image_target: None,
             },
             status: Status {
                 phase,

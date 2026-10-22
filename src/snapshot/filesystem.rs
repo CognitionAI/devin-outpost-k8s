@@ -10,6 +10,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+
+use crate::api::OutpostDevin;
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
@@ -54,7 +56,8 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
     ///
     /// An existing PVC is reused as-is — its spec is immutable, and changed
     /// pool volume settings only affect volumes created afterwards.
-    async fn prepare(&self, session_id: &str) -> Result<PreparedSession> {
+    async fn prepare(&self, session: &OutpostDevin) -> Result<PreparedSession> {
+        let session_id = &session.metadata.session_id;
         let name = state_pvc_name(session_id);
         match self.pvcs().get_opt(&name).await? {
             Some(existing) => {
@@ -68,7 +71,7 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
                 }
             }
             None => {
-                let pvc = build_state_pvc(&self.pool, session_id, &self.pool.spec.resume)?;
+                let pvc = build_state_pvc(&self.pool, session, &self.pool.spec.resume)?;
                 match self.pvcs().create(&Default::default(), &pvc).await {
                     Ok(_) => {}
                     Err(kube::Error::Api(e)) if e.code == 409 => {}

@@ -80,6 +80,21 @@ pub struct Spec {
     /// for how it is enforced).
     #[serde(default)]
     pub network_policy: NetworkPolicy,
+    /// Container image, by digest, the worker must run for this session: the
+    /// DRS build of the session's org, which already holds its repos and
+    /// dependencies. Fixed for the life of the session, so a resume runs the
+    /// image it started on. `None` => the pool's own worker image.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// The session exists to build the pool's next image rather than to run
+    /// an agent, so it alone gets the pool's `imageBuild` settings.
+    #[serde(default)]
+    pub image_build: bool,
+    /// For an image build: `repository/path:tag` the built image is pushed
+    /// to. Set by the control plane so the build box, where the customer's
+    /// blueprints run, cannot choose where its image goes.
+    #[serde(default)]
+    pub image_target: Option<String>,
 }
 
 /// The egress restrictions of a session.

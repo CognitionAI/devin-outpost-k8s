@@ -429,6 +429,7 @@ mod tests {
                 max_concurrent_sessions: 10,
                 worker: serde_json::from_value(json!({})).unwrap(),
                 resume: Default::default(),
+                image_build: None,
             },
         );
         pool.metadata.namespace = Some("ns".to_string());

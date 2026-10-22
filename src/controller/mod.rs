@@ -64,10 +64,10 @@ pub use pod::{
     ANNOTATION_POOL_ID, ANNOTATION_SUSPENDED_AT, DEFAULT_STATIC_BASE_URL, DEFAULT_WORKER_IMAGE,
     ENV_GATEWAY_URL, ENV_REMOTE_BINARY_SHA, ENV_SESSION_TOKEN, ENV_STATIC_BASE_URL,
     ENV_WORKER_CACHE_DIR, LABEL_MANAGED_BY, LABEL_NETWORK_POLICY, LABEL_POOL, LABEL_SESSION_ID,
-    SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_SUBDIR, WorkerPodParams,
-    build_session_token_secret, build_state_pvc, build_worker_pod, network_policy_name,
-    session_labels, session_token_secret_name, state_pvc_name, worker_pod_name,
-    worker_static_base_url,
+    PUSH_SIDECAR_CONTAINER_NAME, SESSION_TOKEN_SECRET_KEY, WORKER_COMMAND, WORKER_DATA_SUBDIR,
+    WorkerPodParams, build_session_token_secret, build_state_pvc, build_worker_pod,
+    network_policy_name, session_labels, session_token_secret_name, state_pvc_name,
+    worker_pod_name, worker_static_base_url,
 };
 pub use queue_watch::PoolWatchers;
 pub use reconcile::{error_policy, reconcile, run};

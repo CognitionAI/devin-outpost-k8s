@@ -52,6 +52,37 @@ pub struct OutpostPoolSpec {
     /// How `resume`-kind sessions are served for this pool.
     #[serde(default)]
     pub resume: ResumeConfig,
+
+    /// Settings applied only to the sessions that build the pool's next
+    /// image (queue items with `spec.image_build`). Agent sessions never see
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_build: Option<ImageBuildConfig>,
+}
+
+/// What the push sidecar of an image-build session needs (see
+/// [`crate::image_push`]). Only that sidecar
+/// sees these; the worker container running the customer's blueprints gets
+/// none of them. Where the image goes comes from the queue entry
+/// (`spec.image_target`), not from here.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageBuildConfig {
+    /// `Secret` in the pool's namespace whose `username` and `password` keys
+    /// can push to the pool's image repository. Push-only, for that path,
+    /// is enough. `None` => the registry takes anonymous pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_secret_name: Option<String>,
+
+    /// Image the build is layered on. It must be the image the build pod
+    /// runs and live in the same registry as the repository pushed to.
+    /// `None` => the pool's worker image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
+
+    /// Reach the registry over plain HTTP.
+    #[serde(default)]
+    pub insecure_registry: bool,
 }
 
 /// A reference to a single key within a `Secret` in the same namespace.
@@ -192,7 +223,8 @@ pub struct ResumeConfig {
     /// that new state volumes are cloned from (PVC `spec.dataSource`). It must
     /// hold a home directory for the worker image, at minimum a copy of the
     /// one the image ships (see `examples/golden-home.yaml`). Required for
-    /// the [`ResumePolicy::FilesystemSnapshot`] policy.
+    /// the [`ResumePolicy::FilesystemSnapshot`] policy, except for sessions
+    /// that bring their own image (see [`crate::controller::build_state_pvc`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_data_source: Option<TypedLocalObjectReference>,
 

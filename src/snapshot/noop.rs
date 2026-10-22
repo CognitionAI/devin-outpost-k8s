@@ -2,6 +2,8 @@
 
 use async_trait::async_trait;
 
+use crate::api::OutpostDevin;
+
 use crate::error::Result;
 
 use super::{PreparedSession, SnapshotOutcome, SnapshotProvider};
@@ -18,7 +20,7 @@ impl SnapshotProvider for NoopSnapshotProvider {
         "noop"
     }
 
-    async fn prepare(&self, _session_id: &str) -> Result<PreparedSession> {
+    async fn prepare(&self, _session: &OutpostDevin) -> Result<PreparedSession> {
         Ok(PreparedSession::default())
     }
 

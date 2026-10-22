@@ -29,6 +29,8 @@ pub use noop::NoopSnapshotProvider;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+
+use crate::api::OutpostDevin;
 use kube::Client;
 
 use crate::crd::{OutpostPool, ResumePolicy};
@@ -78,7 +80,7 @@ pub trait SnapshotProvider: Send + Sync {
 
     /// Set up per-session state before the worker pod is created: a state
     /// volume, a snapshot policy + restore pin, or nothing.
-    async fn prepare(&self, session_id: &str) -> Result<PreparedSession>;
+    async fn prepare(&self, session: &OutpostDevin) -> Result<PreparedSession>;
 
     /// Judge whether a started worker pod came back from its expected
     /// snapshot. Pure inspection of the pod object; must not perform I/O.

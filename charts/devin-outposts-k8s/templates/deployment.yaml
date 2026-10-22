@@ -50,6 +50,9 @@ spec:
               value: {{ .Values.operator.defaultApiUrl | quote }}
             - name: DEVIN_WORKER_IMAGE
               value: {{ .Values.operator.defaultWorkerImage | quote }}
+            # Image-build pods run this same image as their push sidecar.
+            - name: OPERATOR_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
             - name: ACCEPTOR_ID
               value: {{ .Values.operator.acceptorId | quote }}
             # An unquoted `off` in a values file is a YAML boolean.
