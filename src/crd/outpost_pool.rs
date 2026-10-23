@@ -74,9 +74,9 @@ pub struct ImageBuildConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_secret_name: Option<String>,
 
-    /// Image the build is layered on. It must be the image the build pod
-    /// runs and live in the same registry as the repository pushed to.
-    /// `None` => the pool's worker image.
+    /// Base image for the build worker and publisher unless `spec.image` is
+    /// set. Must live in the same registry as the target. `None` uses the
+    /// pool's worker image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
 

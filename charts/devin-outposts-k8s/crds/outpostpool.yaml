@@ -58,7 +58,7 @@
                     "nullable": true,
                     "properties": {
                       "baseImage": {
-                        "description": "Image the build is layered on. It must be the image the build pod\nruns and live in the same registry as the repository pushed to.\n`None` => the pool's worker image.",
+                        "description": "Base image for the build worker and publisher unless `spec.image` is\nset. Must live in the same registry as the target. `None` uses the\npool's worker image.",
                         "nullable": true,
                         "type": "string"
                       },

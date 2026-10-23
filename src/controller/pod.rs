@@ -386,6 +386,7 @@ fn seed_home_container(image: &str, home_dir: &str) -> Container {
         ]),
         security_context: Some(SecurityContext {
             run_as_user: Some(0),
+            run_as_non_root: Some(false),
             ..Default::default()
         }),
         volume_mounts: Some(vec![VolumeMount {
@@ -479,6 +480,20 @@ fn push_sidecar_container(
     })
 }
 
+pub(super) fn effective_worker_image<'a>(
+    session: &'a OutpostDevin,
+    pool_image: &'a str,
+    build_image: Option<&'a str>,
+) -> &'a str {
+    session.spec.image.as_deref().unwrap_or_else(|| {
+        if session.spec.image_build {
+            build_image.unwrap_or(pool_image)
+        } else {
+            pool_image
+        }
+    })
+}
+
 /// Build the worker `Pod` for one claimed session.
 ///
 /// The pool's [`crate::crd::WorkerTemplate`] is assembled in three layers (see
@@ -490,13 +505,15 @@ fn push_sidecar_container(
 ///    volumes, sidecars, pod metadata, etc.
 /// 2. **Operator vars:** find the container named `worker.container_name`
 ///    (default `devin-worker`), inserting an empty one if absent. Set its
-///    `image` to `default_image`, its command/args and env per the module-level
+///    `image` per `effective_worker_image`: a session image (`spec.image`)
+///    wins, an image-build session falls back to `imageBuild.baseImage`, and
+///    otherwise the pool's `worker.overrides.image` or `default_image` is
+///    used. Set its command/args and env per the module-level
 ///    contract. Set `restartPolicy = OnFailure` (see the lifecycle mapping in
 ///    [`crate::controller`]), and attach a deterministic pod name, identifying
-///    labels/annotations, and an owner reference to the pool for GC. A
-///    session image (`spec.image`) replaces `default_image`.
+///    labels/annotations, and an owner reference to the pool for GC.
 /// 3. **Overrides:** apply `worker.overrides`. Each `Some` field wins over the
-///    layer-2 value: `image` (unless the session carries its own), `command`, `args`, `restart_policy`, and the pod
+///    layer-2 value: `command`, `args`, `restart_policy`, and the pod
 ///    `labels`/`annotations` (which *replace* the operator's merged set). The
 ///    pod name and owner reference stay operator-owned and are never overridden.
 pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
@@ -519,6 +536,13 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     let template = worker.template.clone();
     let mut spec = template.spec.unwrap_or_default();
     let template_meta = template.metadata.unwrap_or_default();
+    if session.spec.image_build
+        && (spec.share_process_namespace == Some(true) || spec.host_pid == Some(true))
+    {
+        return Err(Error::Config(
+            "image-build pods require shareProcessNamespace and hostPID to be disabled".into(),
+        ));
+    }
 
     // Layer 2: operator vars on the worker container.
     let container = match spec
@@ -536,7 +560,14 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         }
     };
 
-    let image = session.spec.image.as_deref().unwrap_or(default_image);
+    let image = effective_worker_image(
+        session,
+        overrides.image.as_deref().unwrap_or(default_image),
+        pool.spec
+            .image_build
+            .as_ref()
+            .and_then(|config| config.base_image.as_deref()),
+    );
     container.image = Some(image.to_string());
     container.command = Some(vec![WORKER_COMMAND.to_string()]);
     container.args = Some(vec![
@@ -603,12 +634,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     }
     if session.spec.image_build {
         let config = pool.spec.image_build.clone().unwrap_or_default();
-        let base_image = config
-            .base_image
-            .as_deref()
-            .or(overrides.image.as_deref())
-            .unwrap_or(default_image);
-        let sidecar = push_sidecar_container(&config, session, operator_image, base_image)?;
+        let sidecar = push_sidecar_container(&config, session, operator_image, image)?;
         operator_env.push(EnvVar {
             name: image_push::ENV_LAYER_DIR.to_string(),
             value: Some(image_push::LAYER_DIR.to_string()),
@@ -644,11 +670,6 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
 
     // Layer 3: pool overrides win over layer 2 (but never over the pod name
     // or owner reference).
-    if let Some(image) = &overrides.image
-        && session.spec.image.is_none()
-    {
-        container.image = Some(image.clone());
-    }
     if let Some(command) = &overrides.command {
         container.command = Some(command.clone());
     }
@@ -937,6 +958,47 @@ mod tests {
                 .iter()
                 .any(|v| v.name == shared.name && v.empty_dir.is_some())
         );
+
+        for (overrides_image, base_image, session_image, expected) in [
+            (None, None, None, "img:default"),
+            (Some("img:pool"), None, None, "img:pool"),
+            (Some("img:pool"), Some("img:base"), None, "img:base"),
+            (
+                Some("img:pool"),
+                Some("img:base"),
+                Some("img:session"),
+                "img:session",
+            ),
+        ] {
+            pool.spec.worker.overrides.image = overrides_image.map(str::to_string);
+            pool.spec.image_build.as_mut().unwrap().base_image = base_image.map(str::to_string);
+            build.spec.image = session_image.map(str::to_string);
+            let pod = build_worker_pod(params(&pool, &build)).unwrap();
+            let spec = pod.spec.unwrap();
+            assert_eq!(spec.containers[0].image.as_deref(), Some(expected));
+            let sidecar_env = drs_env(&spec.init_containers.as_ref().unwrap()[0]);
+            assert_eq!(
+                sidecar_env[image_push::ENV_BASE_IMAGE].value.as_deref(),
+                Some(expected)
+            );
+        }
+        build.spec.image = None;
+        pool.spec.worker.overrides.image = None;
+        pool.spec.image_build.as_mut().unwrap().base_image = None;
+
+        for (shared, host) in [(true, false), (false, true)] {
+            let spec = pool.spec.worker.template.spec.as_mut().unwrap();
+            spec.share_process_namespace = Some(shared);
+            spec.host_pid = Some(host);
+            assert!(matches!(
+                build_worker_pod(params(&pool, &build)),
+                Err(Error::Config(_))
+            ));
+            assert!(build_worker_pod(params(&pool, &session("devin-agent"))).is_ok());
+            let spec = pool.spec.worker.template.spec.as_mut().unwrap();
+            spec.share_process_namespace = None;
+            spec.host_pid = None;
+        }
 
         // No operator image, no sidecar, no build.
         let err = build_worker_pod(WorkerPodParams {
@@ -1235,6 +1297,16 @@ mod tests {
     fn session_image_wins_over_the_pool_image_and_seeds_its_own_home() {
         let mut pool = pool();
         pool.spec.worker.overrides.image = Some("img:pool".to_string());
+        pool.spec
+            .worker
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .security_context = Some(k8s_openapi::api::core::v1::PodSecurityContext {
+            run_as_non_root: Some(true),
+            ..Default::default()
+        });
         let mut session = session("devin-1");
         session.spec.image = Some("reg/drs@sha256:abc".to_string());
 
@@ -1259,6 +1331,15 @@ mod tests {
         // mounts as home, at a path that leaves the image's home readable.
         let seed = &spec.init_containers.as_ref().unwrap()[0];
         assert_eq!(seed.image.as_deref(), Some("reg/drs@sha256:abc"));
+        let seed_security = seed.security_context.as_ref().unwrap();
+        assert_eq!(seed_security.run_as_user, Some(0));
+        assert_eq!(
+            seed_security.run_as_non_root.or(spec
+                .security_context
+                .as_ref()
+                .and_then(|s| s.run_as_non_root)),
+            Some(false)
+        );
         let seed_mount = &seed.volume_mounts.as_ref().unwrap()[0];
         let home_mount = worker
             .volume_mounts

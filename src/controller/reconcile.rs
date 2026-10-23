@@ -243,6 +243,11 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
             .image
             .as_deref()
             .unwrap_or(&ctx.config.default_worker_image),
+        build_image: pool
+            .spec
+            .image_build
+            .as_ref()
+            .and_then(|config| config.base_image.as_deref()),
         now,
     });
 
