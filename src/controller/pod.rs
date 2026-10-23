@@ -313,21 +313,27 @@ pub fn build_session_token_secret(
 /// created, retained and deleted). It is cloned from `resume.volumeDataSource`
 /// rather than created empty: the volume becomes the worker's home directory,
 /// and an empty one would hide everything the image ships there. A session
-/// with its own image (`spec.image`) is the exception: its volume is created
-/// empty and seeded from that image by the worker pod, because the pool's
-/// data source holds the home of a different image.
+/// with a session-specific or configured build image is the exception: its
+/// volume is created empty and seeded from that image by the worker pod,
+/// because the pool's data source holds the home of a different image.
 pub fn build_state_pvc(
     pool: &OutpostPool,
     session: &OutpostDevin,
     resume: &ResumeConfig,
 ) -> Result<PersistentVolumeClaim> {
     let session_id = &session.metadata.session_id;
-    let data_source = match &session.spec.image {
+    let data_source = match session_image_override(
+        session,
+        pool.spec
+            .image_build
+            .as_ref()
+            .and_then(|config| config.base_image.as_deref()),
+    ) {
         Some(_) => None,
         None => Some(resume.volume_data_source.clone().ok_or_else(|| {
             Error::Config(
                 "resume.volumeDataSource is required for the FilesystemSnapshot policy \
-                 when the session carries no image"
+                 when no session or build image is selected"
                     .to_string(),
             )
         })?),
@@ -480,18 +486,27 @@ fn push_sidecar_container(
     })
 }
 
+fn session_image_override<'a>(
+    session: &'a OutpostDevin,
+    build_image: Option<&'a str>,
+) -> Option<&'a str> {
+    session
+        .spec
+        .image
+        .as_deref()
+        .or(if session.spec.image_build {
+            build_image
+        } else {
+            None
+        })
+}
+
 pub(super) fn effective_worker_image<'a>(
     session: &'a OutpostDevin,
     pool_image: &'a str,
     build_image: Option<&'a str>,
 ) -> &'a str {
-    session.spec.image.as_deref().unwrap_or_else(|| {
-        if session.spec.image_build {
-            build_image.unwrap_or(pool_image)
-        } else {
-            pool_image
-        }
-    })
+    session_image_override(session, build_image).unwrap_or(pool_image)
 }
 
 /// Build the worker `Pod` for one claimed session.
@@ -505,11 +520,9 @@ pub(super) fn effective_worker_image<'a>(
 ///    volumes, sidecars, pod metadata, etc.
 /// 2. **Operator vars:** find the container named `worker.container_name`
 ///    (default `devin-worker`), inserting an empty one if absent. Set its
-///    `image` per `effective_worker_image`: a session image (`spec.image`)
-///    wins, an image-build session falls back to `imageBuild.baseImage`, and
-///    otherwise the pool's `worker.overrides.image` or `default_image` is
-///    used. Set its command/args and env per the module-level
-///    contract. Set `restartPolicy = OnFailure` (see the lifecycle mapping in
+///    `image` according to [`crate::crd::ImageBuildConfig::base_image`],
+///    and its command/args and env per the module-level contract. Set
+///    `restartPolicy = OnFailure` (see the lifecycle mapping in
 ///    [`crate::controller`]), and attach a deterministic pod name, identifying
 ///    labels/annotations, and an owner reference to the pool for GC.
 /// 3. **Overrides:** apply `worker.overrides`. Each `Some` field wins over the
@@ -560,13 +573,15 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         }
     };
 
+    let build_image = pool
+        .spec
+        .image_build
+        .as_ref()
+        .and_then(|config| config.base_image.as_deref());
     let image = effective_worker_image(
         session,
         overrides.image.as_deref().unwrap_or(default_image),
-        pool.spec
-            .image_build
-            .as_ref()
-            .and_then(|config| config.base_image.as_deref()),
+        build_image,
     );
     container.image = Some(image.to_string());
     container.command = Some(vec![WORKER_COMMAND.to_string()]);
@@ -660,7 +675,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     env.retain(|e| operator_env.iter().all(|o| o.name != e.name));
     env.extend(operator_env);
 
-    if let (Some(image), Some(_)) = (&session.spec.image, state_pvc_name) {
+    if let (Some(image), Some(_)) = (session_image_override(session, build_image), state_pvc_name) {
         spec.init_containers
             .get_or_insert_default()
             .push(seed_home_container(image, pool.spec.resume.home_dir()));
@@ -1284,13 +1299,21 @@ mod tests {
 
     #[test]
     fn state_pvc_requires_and_clones_the_data_source() {
-        let pool = pool();
-        let err = build_state_pvc(&pool, &session("devin-1"), &Default::default()).unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err}");
+        for (image_build, base_image) in [(false, Some("img:build")), (true, None)] {
+            let mut pool = pool();
+            pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
+                base_image: base_image.map(str::to_string),
+                ..Default::default()
+            });
+            let mut session = session("devin-1");
+            session.spec.image_build = image_build;
+            let err = build_state_pvc(&pool, &session, &Default::default()).unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "{err}");
 
-        let resume = golden_resume();
-        let pvc = build_state_pvc(&pool, &session("devin-1"), &resume).unwrap();
-        assert_eq!(pvc.spec.unwrap().data_source, resume.volume_data_source);
+            let resume = golden_resume();
+            let pvc = build_state_pvc(&pool, &session, &resume).unwrap();
+            assert_eq!(pvc.spec.unwrap().data_source, resume.volume_data_source);
+        }
     }
 
     #[test]
@@ -1307,52 +1330,74 @@ mod tests {
             run_as_non_root: Some(true),
             ..Default::default()
         });
+        pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
+            base_image: Some("img:build".to_string()),
+            ..Default::default()
+        });
         let mut session = session("devin-1");
-        session.spec.image = Some("reg/drs@sha256:abc".to_string());
+        session.spec.image_target = Some("reg.example/drs:job-1".to_string());
+        for (session_image, image_build, expected) in [
+            (Some("reg/drs@sha256:abc"), false, "reg/drs@sha256:abc"),
+            (None, true, "img:build"),
+            (Some("reg/drs@sha256:abc"), true, "reg/drs@sha256:abc"),
+        ] {
+            session.spec.image = session_image.map(str::to_string);
+            session.spec.image_build = image_build;
 
-        // No golden volume: the state volume starts empty.
-        let pvc = build_state_pvc(&pool, &session, &Default::default()).unwrap();
-        assert_eq!(pvc.spec.unwrap().data_source, None);
+            // No golden volume: the state volume starts empty.
+            let pvc = build_state_pvc(&pool, &session, &Default::default()).unwrap();
+            assert_eq!(pvc.spec.unwrap().data_source, None);
+            let pvc = build_state_pvc(&pool, &session, &golden_resume()).unwrap();
+            assert_eq!(pvc.spec.unwrap().data_source, None);
 
-        let pod = build_worker_pod(WorkerPodParams {
-            state_pvc_name: Some("pvc-x"),
-            ..params(&pool, &session)
-        })
-        .unwrap();
-        let spec = pod.spec.unwrap();
-        let worker = spec
-            .containers
-            .iter()
-            .find(|c| c.name == "devin-worker")
+            let pod = build_worker_pod(WorkerPodParams {
+                state_pvc_name: Some("pvc-x"),
+                ..params(&pool, &session)
+            })
             .unwrap();
-        assert_eq!(worker.image.as_deref(), Some("reg/drs@sha256:abc"));
+            let spec = pod.spec.unwrap();
+            let worker = spec
+                .containers
+                .iter()
+                .find(|c| c.name == "devin-worker")
+                .unwrap();
+            assert_eq!(worker.image.as_deref(), Some(expected));
 
-        // The seed runs the session image and writes to the volume the worker
-        // mounts as home, at a path that leaves the image's home readable.
-        let seed = &spec.init_containers.as_ref().unwrap()[0];
-        assert_eq!(seed.image.as_deref(), Some("reg/drs@sha256:abc"));
-        let seed_security = seed.security_context.as_ref().unwrap();
-        assert_eq!(seed_security.run_as_user, Some(0));
-        assert_eq!(
-            seed_security.run_as_non_root.or(spec
-                .security_context
+            // The seed runs the session image and writes to the volume the
+            // worker mounts as home, at a path that leaves the image's home
+            // readable.
+            let seed = spec
+                .init_containers
                 .as_ref()
-                .and_then(|s| s.run_as_non_root)),
-            Some(false)
-        );
-        let seed_mount = &seed.volume_mounts.as_ref().unwrap()[0];
-        let home_mount = worker
-            .volume_mounts
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|m| m.mount_path == "/home/ubuntu")
-            .unwrap();
-        assert_eq!(seed_mount.name, home_mount.name);
-        assert_ne!(seed_mount.mount_path, home_mount.mount_path);
+                .unwrap()
+                .iter()
+                .find(|c| c.name == SEED_HOME_CONTAINER_NAME)
+                .unwrap();
+            assert_eq!(seed.image.as_deref(), Some(expected));
+            let seed_security = seed.security_context.as_ref().unwrap();
+            assert_eq!(seed_security.run_as_user, Some(0));
+            assert_eq!(
+                seed_security.run_as_non_root.or(spec
+                    .security_context
+                    .as_ref()
+                    .and_then(|s| s.run_as_non_root)),
+                Some(false)
+            );
+            let seed_mount = &seed.volume_mounts.as_ref().unwrap()[0];
+            let home_mount = worker
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.mount_path == "/home/ubuntu")
+                .unwrap();
+            assert_eq!(seed_mount.name, home_mount.name);
+            assert_ne!(seed_mount.mount_path, home_mount.mount_path);
+        }
 
         // Without a session image the pool's own image and no seed.
         session.spec.image = None;
+        session.spec.image_build = false;
         let pod = build_worker_pod(params(&pool, &session)).unwrap();
         let spec = pod.spec.unwrap();
         assert_eq!(

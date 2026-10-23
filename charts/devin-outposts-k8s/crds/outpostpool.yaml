@@ -125,7 +125,7 @@
                         "type": "string"
                       },
                       "volumeDataSource": {
-                        "description": "`VolumeSnapshot` or `PersistentVolumeClaim` in the pool's namespace\nthat new state volumes are cloned from (PVC `spec.dataSource`). It must\nhold a home directory for the worker image, at minimum a copy of the\none the image ships (see `examples/golden-home.yaml`). Required for\nthe [`ResumePolicy::FilesystemSnapshot`] policy, except for sessions\nthat bring their own image (see [`crate::controller::build_state_pvc`]).",
+                        "description": "`VolumeSnapshot` or `PersistentVolumeClaim` in the pool's namespace\nthat new state volumes are cloned from (PVC `spec.dataSource`). It must\nhold a home directory for the worker image, at minimum a copy of the\none the image ships (see `examples/golden-home.yaml`). Required for\nthe [`ResumePolicy::FilesystemSnapshot`] policy except when\n[`crate::controller::build_state_pvc`] selects image-based home\nseeding.",
                         "nullable": true,
                         "properties": {
                           "apiGroup": {

@@ -223,8 +223,9 @@ pub struct ResumeConfig {
     /// that new state volumes are cloned from (PVC `spec.dataSource`). It must
     /// hold a home directory for the worker image, at minimum a copy of the
     /// one the image ships (see `examples/golden-home.yaml`). Required for
-    /// the [`ResumePolicy::FilesystemSnapshot`] policy, except for sessions
-    /// that bring their own image (see [`crate::controller::build_state_pvc`]).
+    /// the [`ResumePolicy::FilesystemSnapshot`] policy except when
+    /// [`crate::controller::build_state_pvc`] selects image-based home
+    /// seeding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_data_source: Option<TypedLocalObjectReference>,
 
