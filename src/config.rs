@@ -26,6 +26,11 @@ pub struct OperatorConfig {
     /// unset (typically set via the Helm chart). Only the `stable` tag is
     /// supported; never pin a versioned tag.
     pub default_worker_image: String,
+    /// This operator's own image, which image-build pods run as their push
+    /// sidecar (see [`crate::image_push`]). The chart sets it from
+    /// `image.repository` / `image.tag`. `None` => pools cannot run
+    /// image-build sessions.
+    pub operator_image: Option<String>,
 
     /// How long to wait between full re-list/reconcile passes of a pool's queue.
     pub reconcile_interval: Duration,
@@ -70,6 +75,7 @@ impl Default for OperatorConfig {
             watch_namespace: None,
             default_api_url: crate::api::DEFAULT_API_URL.to_string(),
             default_worker_image: crate::controller::DEFAULT_WORKER_IMAGE.to_string(),
+            operator_image: None,
             reconcile_interval: Duration::from_secs(30),
             claim_renew_margin: Duration::from_secs(60),
             acceptor_id: None,
@@ -96,6 +102,7 @@ impl OperatorConfig {
     /// | `WATCH_NAMESPACE` | [`Self::watch_namespace`] |
     /// | `DEVIN_API_URL` | [`Self::default_api_url`] |
     /// | `DEVIN_WORKER_IMAGE` | [`Self::default_worker_image`] |
+    /// | `OPERATOR_IMAGE` | [`Self::operator_image`] |
     /// | `RECONCILE_INTERVAL_SECONDS` | [`Self::reconcile_interval`] |
     /// | `CLAIM_RENEW_MARGIN_SECONDS` | [`Self::claim_renew_margin`] |
     /// | `ACCEPTOR_ID` | [`Self::acceptor_id`] |
@@ -169,6 +176,7 @@ impl OperatorConfig {
             default_api_url: get("DEVIN_API_URL").unwrap_or(defaults.default_api_url),
             default_worker_image: get("DEVIN_WORKER_IMAGE")
                 .unwrap_or(defaults.default_worker_image),
+            operator_image: get("OPERATOR_IMAGE"),
             reconcile_interval: parse_secs(
                 "RECONCILE_INTERVAL_SECONDS",
                 defaults.reconcile_interval,

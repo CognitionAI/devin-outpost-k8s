@@ -243,6 +243,11 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
             .image
             .as_deref()
             .unwrap_or(&ctx.config.default_worker_image),
+        build_image: pool
+            .spec
+            .image_build
+            .as_ref()
+            .and_then(|config| config.base_image.as_deref()),
         now,
     });
 
@@ -486,7 +491,7 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         )
     })?;
 
-    let mut prepared = sync.provider.prepare(session_id).await?;
+    let mut prepared = sync.provider.prepare(&claimed).await?;
     // See `recycle_unrestored_pod`: a crashed restore's replacement starts
     // without the provider's restore annotations so it deliberately
     // cold-starts instead of looping.
@@ -531,8 +536,10 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         token_secret_name: &secret.name_any(),
         default_image: &sync.ctx.config.default_worker_image,
         state_pvc_name: prepared.state_pvc_name.as_deref(),
+        seed_home: prepared.seed_home,
         provider_annotations: &prepared.pod_annotations,
         network_policy_name: policy_name.as_deref(),
+        operator_image: sync.ctx.config.operator_image.as_deref(),
     })?;
 
     let allow = match enforced_through {

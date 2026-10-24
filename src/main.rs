@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use devin_outposts_k8s::config::OperatorConfig;
 use devin_outposts_k8s::metrics::{self, Metrics};
-use devin_outposts_k8s::{controller, elector, telemetry};
+use devin_outposts_k8s::{controller, elector, image_push, telemetry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,6 +19,12 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("no other crypto provider is installed before this");
+
+    // The same binary is the push sidecar of image-build pods (see
+    // [`image_push`]): the customer already mirrors this image.
+    if std::env::args().nth(1).as_deref() == Some(image_push::SUBCOMMAND) {
+        return image_push::main().await;
+    }
 
     let config = Arc::new(OperatorConfig::from_env()?);
     tracing::info!(?config, "starting devin-outposts-k8s");

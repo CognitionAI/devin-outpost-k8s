@@ -12,6 +12,8 @@ use k8s_openapi::api::core::v1::Pod;
 
 use crate::api::{OutpostDevin, Phase, SessionStatus};
 
+use super::pod::effective_worker_image;
+
 /// Observed inputs to [`plan`].
 #[derive(Debug)]
 pub struct Observed<'a> {
@@ -31,9 +33,10 @@ pub struct Observed<'a> {
     pub renew_margin_secs: i64,
     /// Name of the worker container within the pod (`worker.containerName`).
     pub container_name: &'a str,
-    /// Image the operator would set on a newly created worker pod (the pool's
-    /// `worker.overrides.image` or the operator default).
+    /// Pool-level image fallback (worker.overrides.image or the operator
+    /// default); session and build images take precedence.
     pub desired_image: &'a str,
+    pub build_image: Option<&'a str>,
     /// Current unix time (seconds); injected for testability.
     pub now: i64,
 }
@@ -162,7 +165,12 @@ pub fn plan(observed: &Observed<'_>) -> Vec<Action> {
                     });
                     active_ours -= 1;
                 } else if pod_crash_looping(pod)
-                    && worker_image(pod, observed.container_name) != Some(observed.desired_image)
+                    && worker_image(pod, observed.container_name)
+                        != Some(effective_worker_image(
+                            session,
+                            observed.desired_image,
+                            observed.build_image,
+                        ))
                 {
                     actions.push(Action::ReplaceDriftedPod { session_id });
                 } else if session
@@ -264,6 +272,9 @@ mod tests {
                 platform: "linux".to_string(),
                 remote_binary_sha: None,
                 network_policy: Default::default(),
+                image: None,
+                image_build: false,
+                image_target: None,
             },
             status: Status {
                 phase,
@@ -305,6 +316,7 @@ mod tests {
             renew_margin_secs: 60,
             container_name: "devin-worker",
             desired_image: "img:current",
+            build_image: None,
             now: 0,
         }
     }
@@ -450,13 +462,40 @@ mod tests {
 
     #[test]
     fn crash_looping_pods_on_the_current_image_are_left_to_the_restart_limit() {
-        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
-        let pods = BTreeMap::from([(
-            "s".to_string(),
-            pod_with_image("Running", 2, false, "img:current"),
-        )]);
-        // Deadline 1000, now 0, margin 60 => no renewal either.
-        assert_eq!(plan(&observed(&sessions, &pods, &[])), vec![]);
+        for (image, image_build, build_base, expected) in [
+            (None, false, None, "img:current"),
+            (Some("img:session"), false, None, "img:session"),
+            (None, true, Some("img:build"), "img:build"),
+            (Some("img:session"), true, Some("img:build"), "img:session"),
+            (None, false, Some("img:build"), "img:current"),
+        ] {
+            let mut s = session("s", 1, Phase::Claimed, SessionStatus::Running);
+            s.spec.image = image.map(str::to_string);
+            s.spec.image_build = image_build;
+            let sessions = vec![s];
+            for restarts in 1..=4 {
+                let pods = BTreeMap::from([(
+                    "s".to_string(),
+                    pod_with_image("Running", restarts, false, expected),
+                )]);
+                let mut obs = observed(&sessions, &pods, &[]);
+                obs.build_image = build_base;
+                // Deadline 1000, now 0, margin 60 => no renewal either.
+                let actions = plan(&obs);
+                if restarts <= 3 {
+                    assert_eq!(actions, vec![], "case {expected} restarts {restarts}");
+                } else {
+                    assert_eq!(
+                        actions,
+                        vec![Action::GiveUp {
+                            session_id: "s".into(),
+                            restarts: 4
+                        }],
+                        "case {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
