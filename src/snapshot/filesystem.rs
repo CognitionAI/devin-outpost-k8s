@@ -55,11 +55,13 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
     /// (the session is live again, so TTL GC must leave it alone).
     ///
     /// An existing PVC is reused as-is — its spec is immutable, and changed
-    /// pool volume settings only affect volumes created afterwards.
+    /// pool volume settings only affect volumes created afterwards. Its data
+    /// source distinguishes cloned homes from empty homes that may still need
+    /// seeding after an interrupted pod creation.
     async fn prepare(&self, session: &OutpostDevin) -> Result<PreparedSession> {
         let session_id = &session.metadata.session_id;
         let name = state_pvc_name(session_id);
-        match self.pvcs().get_opt(&name).await? {
+        let pvc = match self.pvcs().get_opt(&name).await? {
             Some(existing) => {
                 if existing.annotations().contains_key(ANNOTATION_SUSPENDED_AT) {
                     let patch = serde_json::json!({
@@ -69,20 +71,18 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
                         .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await?;
                 }
+                existing
             }
             None => {
                 let pvc = build_state_pvc(&self.pool, session, &self.pool.spec.resume)?;
                 match self.pvcs().create(&Default::default(), &pvc).await {
-                    Ok(_) => {}
-                    Err(kube::Error::Api(e)) if e.code == 409 => {}
+                    Ok(created) => created,
+                    Err(kube::Error::Api(e)) if e.code == 409 => self.pvcs().get(&name).await?,
                     Err(e) => return Err(e.into()),
                 }
             }
-        }
-        Ok(PreparedSession {
-            state_pvc_name: Some(name),
-            ..Default::default()
-        })
+        };
+        Ok(PreparedSession::from_pvc(&pvc))
     }
 
     /// Data is already durable on the PVC; just timestamp it for TTL GC.

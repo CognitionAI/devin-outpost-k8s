@@ -536,6 +536,7 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         token_secret_name: &secret.name_any(),
         default_image: &sync.ctx.config.default_worker_image,
         state_pvc_name: prepared.state_pvc_name.as_deref(),
+        seed_home: prepared.seed_home,
         provider_annotations: &prepared.pod_annotations,
         network_policy_name: policy_name.as_deref(),
         operator_image: sync.ctx.config.operator_image.as_deref(),

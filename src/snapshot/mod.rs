@@ -52,9 +52,23 @@ pub struct PreparedSession {
     /// Name of a `PersistentVolumeClaim` the pod must mount as the worker's
     /// home directory (see [`crate::controller::build_worker_pod`]).
     pub state_pvc_name: Option<String>,
+    pub seed_home: bool,
     /// Annotations to add to the worker pod (e.g. pinning the snapshot to
     /// restore from).
     pub pod_annotations: std::collections::BTreeMap<String, String>,
+}
+
+impl PreparedSession {
+    pub(crate) fn from_pvc(pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> Self {
+        Self {
+            state_pvc_name: pvc.metadata.name.clone(),
+            seed_home: pvc
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.data_source.is_none() && spec.data_source_ref.is_none()),
+            ..Self::default()
+        }
+    }
 }
 
 /// Whether a started worker pod came back from a snapshot (see

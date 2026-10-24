@@ -264,6 +264,7 @@ pub struct WorkerPodParams<'a> {
     /// worker's home directory, when the pool's resume policy keeps one (see
     /// [`build_state_pvc`]).
     pub state_pvc_name: Option<&'a str>,
+    pub seed_home: bool,
     /// Annotations required by the pool's snapshot provider (e.g. the GKE
     /// restore pin). Applied after overrides: like the pod name and owner
     /// reference, they are never overridable.
@@ -537,6 +538,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         token_secret_name,
         default_image,
         state_pvc_name,
+        seed_home,
         provider_annotations,
         network_policy_name,
         operator_image,
@@ -675,7 +677,10 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     env.retain(|e| operator_env.iter().all(|o| o.name != e.name));
     env.extend(operator_env);
 
-    if let (Some(image), Some(_)) = (session_image_override(session, build_image), state_pvc_name) {
+    if seed_home
+        && let (Some(image), Some(_)) =
+            (session_image_override(session, build_image), state_pvc_name)
+    {
         spec.init_containers
             .get_or_insert_default()
             .push(seed_home_container(image, pool.spec.resume.home_dir()));
@@ -817,6 +822,7 @@ mod tests {
             token_secret_name: "outpost-token-x",
             default_image: "img:default",
             state_pvc_name: None,
+            seed_home: false,
             provider_annotations: &NO_ANNOTATIONS,
             network_policy_name: None,
             operator_image: Some("ghcr.io/cognitionai/devin-outposts-k8s:sha-1"),
@@ -1336,22 +1342,36 @@ mod tests {
         });
         let mut session = session("devin-1");
         session.spec.image_target = Some("reg.example/drs:job-1".to_string());
-        for (session_image, image_build, expected) in [
-            (Some("reg/drs@sha256:abc"), false, "reg/drs@sha256:abc"),
-            (None, true, "img:build"),
-            (Some("reg/drs@sha256:abc"), true, "reg/drs@sha256:abc"),
+        for (session_image, image_build, kind, expected) in [
+            (
+                Some("reg/drs@sha256:abc"),
+                false,
+                Kind::New,
+                "reg/drs@sha256:abc",
+            ),
+            (None, true, Kind::New, "img:build"),
+            (
+                Some("reg/drs@sha256:abc"),
+                true,
+                Kind::New,
+                "reg/drs@sha256:abc",
+            ),
+            (None, true, Kind::Resume, "img:build"),
         ] {
             session.spec.image = session_image.map(str::to_string);
             session.spec.image_build = image_build;
+            session.spec.kind = kind;
 
             // No golden volume: the state volume starts empty.
             let pvc = build_state_pvc(&pool, &session, &Default::default()).unwrap();
-            assert_eq!(pvc.spec.unwrap().data_source, None);
+            assert_eq!(pvc.spec.as_ref().unwrap().data_source, None);
             let pvc = build_state_pvc(&pool, &session, &golden_resume()).unwrap();
-            assert_eq!(pvc.spec.unwrap().data_source, None);
+            assert_eq!(pvc.spec.as_ref().unwrap().data_source, None);
+            let prepared = crate::snapshot::PreparedSession::from_pvc(&pvc);
 
             let pod = build_worker_pod(WorkerPodParams {
-                state_pvc_name: Some("pvc-x"),
+                state_pvc_name: prepared.state_pvc_name.as_deref(),
+                seed_home: prepared.seed_home,
                 ..params(&pool, &session)
             })
             .unwrap();
@@ -1395,9 +1415,45 @@ mod tests {
             assert_ne!(seed_mount.mount_path, home_mount.mount_path);
         }
 
+        session.spec.image = None;
+        session.spec.image_build = false;
+        session.spec.kind = Kind::New;
+        let cloned = build_state_pvc(&pool, &session, &golden_resume()).unwrap();
+        session.spec.kind = Kind::Resume;
+        session.spec.image_build = true;
+        for use_data_source_ref in [false, true] {
+            let mut retained = cloned.clone();
+            if use_data_source_ref {
+                let spec = retained.spec.as_mut().unwrap();
+                let source = spec.data_source.take().unwrap();
+                spec.data_source_ref = Some(k8s_openapi::api::core::v1::TypedObjectReference {
+                    api_group: source.api_group,
+                    kind: source.kind,
+                    name: source.name,
+                    namespace: None,
+                });
+            }
+            let prepared = crate::snapshot::PreparedSession::from_pvc(&retained);
+            let pod = build_worker_pod(WorkerPodParams {
+                state_pvc_name: prepared.state_pvc_name.as_deref(),
+                seed_home: prepared.seed_home,
+                ..params(&pool, &session)
+            })
+            .unwrap();
+            assert!(
+                pod.spec
+                    .unwrap()
+                    .init_containers
+                    .iter()
+                    .flatten()
+                    .all(|container| container.name != SEED_HOME_CONTAINER_NAME)
+            );
+        }
+
         // Without a session image the pool's own image and no seed.
         session.spec.image = None;
         session.spec.image_build = false;
+        session.spec.kind = Kind::New;
         let pod = build_worker_pod(params(&pool, &session)).unwrap();
         let spec = pod.spec.unwrap();
         assert_eq!(
