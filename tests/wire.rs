@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use devin_outposts_k8s::Error;
 use devin_outposts_k8s::api::{
-    Kind, ListParams, NetDestination, NetworkPolicy, OutpostsClient, Phase, SessionStatus,
-    WatchEventKind,
+    Kind, ListParams, NetDestination, NetworkPolicy, OutpostsClient, Phase, Requester,
+    SessionStatus, WatchEventKind,
 };
 use futures::StreamExt;
 use mock_server::MockQueue;
@@ -74,6 +74,37 @@ async fn list_filters_by_phase_and_acceptor() {
         .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].metadata.session_id, "devin-2");
+}
+
+#[tokio::test]
+async fn requester_is_carried_by_list_and_claim_and_absent_for_non_human_sessions() {
+    let (queue, client) = setup().await;
+    queue.enqueue("devin-human", POOL);
+    queue.set_requester(
+        "devin-human",
+        serde_json::json!({"user_id": "user-1", "email": "dev@example.com"}),
+    );
+    queue.enqueue("devin-automation", POOL);
+
+    let expected = Requester {
+        user_id: "user-1".to_string(),
+        email: Some("dev@example.com".to_string()),
+    };
+    let by_id = |sessions: &[devin_outposts_k8s::api::OutpostDevin], id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.metadata.session_id == id)
+            .unwrap()
+            .metadata
+            .requester
+            .clone()
+    };
+    let listed = client.list_all(POOL, &ListParams::default()).await.unwrap();
+    assert_eq!(by_id(&listed, "devin-human"), Some(expected.clone()));
+    assert_eq!(by_id(&listed, "devin-automation"), None);
+
+    let claimed = client.claim("devin-human").await.unwrap();
+    assert_eq!(claimed.metadata.requester, Some(expected));
 }
 
 #[tokio::test]

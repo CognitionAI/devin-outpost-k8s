@@ -792,6 +792,7 @@ mod tests {
                 outpost_id: "pool_x".to_string(),
                 created_at: Some(1),
                 updated_at: Some(1),
+                requester: None,
             },
             spec: Spec {
                 kind: Kind::New,
