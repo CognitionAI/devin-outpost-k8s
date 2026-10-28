@@ -50,6 +50,16 @@ pub enum SessionStatus {
     Unknown,
 }
 
+/// The human who started a queued session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requester {
+    /// Stable ID of the user.
+    pub user_id: String,
+    /// Email of the user; `None` when their account has none.
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
 /// Identifying metadata for a queued session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
@@ -63,6 +73,12 @@ pub struct Metadata {
     /// When this object last changed (unix seconds).
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// The human who started the session, so a worker can run it as that
+    /// developer. `None` when no human did (automations, service-user API
+    /// keys, chat senders without a linked Devin account) and when the
+    /// server predates the field.
+    #[serde(default)]
+    pub requester: Option<Requester>,
 }
 
 /// Desired state of a queued session.
@@ -278,4 +294,31 @@ pub struct OutpostList {
     /// Whether more pages are available after `end_cursor`.
     #[serde(default)]
     pub has_next_page: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_from_a_server_without_requester_deserializes() {
+        let metadata: Metadata =
+            serde_json::from_str(r#"{"session_id": "devin-1", "outpost_id": "pool_1"}"#).unwrap();
+        assert_eq!(metadata.requester, None);
+    }
+
+    #[test]
+    fn requester_email_is_optional() {
+        let metadata: Metadata = serde_json::from_str(
+            r#"{"session_id": "devin-1", "outpost_id": "pool_1", "requester": {"user_id": "user-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.requester,
+            Some(Requester {
+                user_id: "user-1".to_string(),
+                email: None,
+            })
+        );
+    }
 }
