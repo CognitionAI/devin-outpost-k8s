@@ -53,6 +53,10 @@ pub struct OperatorConfig {
     /// delete the pod. See the lifecycle mapping in [`crate::controller`].
     pub worker_restart_limit: u32,
 
+    /// Initial startup deadline; see the lifecycle mapping in
+    /// [`crate::controller`].
+    pub worker_startup_timeout: Duration,
+
     /// Whether, and through what, session network policies are enforced.
     pub network_policy_enforcement: Enforcement,
 
@@ -80,6 +84,7 @@ impl Default for OperatorConfig {
             claim_renew_margin: Duration::from_secs(60),
             acceptor_id: None,
             worker_restart_limit: 5,
+            worker_startup_timeout: Duration::from_secs(10 * 60),
             network_policy_enforcement: Enforcement::Auto,
             operator_namespace: "default".to_string(),
             identity: "devin-outposts-k8s".to_string(),
@@ -107,6 +112,7 @@ impl OperatorConfig {
     /// | `CLAIM_RENEW_MARGIN_SECONDS` | [`Self::claim_renew_margin`] |
     /// | `ACCEPTOR_ID` | [`Self::acceptor_id`] |
     /// | `WORKER_RESTART_LIMIT` | [`Self::worker_restart_limit`] |
+    /// | `WORKER_STARTUP_TIMEOUT_SECONDS` | [`Self::worker_startup_timeout`] |
     /// | `NETWORK_POLICY_PROVIDER` (`"auto"`, `"off"`, `"cilium"` or `"gke"`) | [`Self::network_policy_enforcement`] |
     /// | `POD_NAMESPACE` (downward API) | [`Self::operator_namespace`] |
     /// | `POD_NAME` (downward API) | [`Self::identity`] |
@@ -187,6 +193,10 @@ impl OperatorConfig {
             )?,
             acceptor_id: get("ACCEPTOR_ID"),
             worker_restart_limit,
+            worker_startup_timeout: parse_secs(
+                "WORKER_STARTUP_TIMEOUT_SECONDS",
+                defaults.worker_startup_timeout,
+            )?,
             network_policy_enforcement,
             operator_namespace,
             identity: get("POD_NAME").unwrap_or(defaults.identity),
@@ -212,6 +222,7 @@ mod tests {
             ("CLAIM_RENEW_MARGIN_SECONDS", "34"),
             ("ACCEPTOR_ID", "my-acceptor"),
             ("WORKER_RESTART_LIMIT", "7"),
+            ("WORKER_STARTUP_TIMEOUT_SECONDS", "90"),
             ("NETWORK_POLICY_PROVIDER", "cilium"),
             ("POD_NAMESPACE", "op-ns"),
             ("POD_NAME", "op-pod-0"),
@@ -233,6 +244,7 @@ mod tests {
         assert_eq!(config.claim_renew_margin, Duration::from_secs(34));
         assert_eq!(config.acceptor_id.as_deref(), Some("my-acceptor"));
         assert_eq!(config.worker_restart_limit, 7);
+        assert_eq!(config.worker_startup_timeout, Duration::from_secs(90));
         assert_eq!(
             config.network_policy_enforcement,
             Enforcement::Through(Provider::Cilium)

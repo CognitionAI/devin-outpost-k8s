@@ -234,6 +234,7 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         acceptor_id: &acceptor_id,
         max_concurrent: pool.spec.max_concurrent_sessions,
         restart_limit: ctx.config.worker_restart_limit,
+        startup_timeout_secs: ctx.config.worker_startup_timeout.as_secs() as i64,
         renew_margin_secs: ctx.config.claim_renew_margin.as_secs() as i64,
         container_name: &pool.spec.worker.container_name,
         desired_image: pool
@@ -332,14 +333,15 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
     {
         let name = secret.name_any();
         if !expected_secrets.contains(&name) {
-            delete_ignoring_missing(&secrets, &name).await?;
-            // A session can leave the queue (tombstoned) without ever being
-            // observed as terminated — e.g. suspended sessions the sweeper
-            // reaps — so the terminate-time snapshot cleanup runs here too.
-            if let Some(session_id) = secret.labels().get(super::LABEL_SESSION_ID)
-                && let Err(err) = provider.on_terminate(session_id).await
-            {
-                warn!(session = %session_id, %err, "snapshot cleanup for vanished session failed");
+            let result = match secret.labels().get(super::LABEL_SESSION_ID) {
+                Some(session_id) => {
+                    delete_session_artifacts(provider.as_ref(), &secrets, session_id, &name).await
+                }
+                None => delete_ignoring_missing(&secrets, &name).await,
+            };
+            if let Err(err) = result {
+                warn!(secret = %name, %err, "cleanup for vanished session failed");
+                first_failure.get_or_insert(err);
             }
         }
     }
@@ -457,6 +459,47 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
                 .get_or_create(&pool_labels(sync.pool))
                 .inc();
             release_ignoring_conflict(sync.outposts, session_id).await?;
+            teardown_session(sync, session_id).await
+        }
+        Action::StartupFailed {
+            session_id,
+            failure,
+        } => {
+            warn!(
+                session = %session_id,
+                reason = failure.reason.as_str(),
+                image = failure.image.as_deref().unwrap_or(""),
+                message = %failure.message,
+                "worker cannot start; reporting the failure and giving the session up"
+            );
+            match sync
+                .outposts
+                .report_startup_failure(session_id, failure)
+                .await
+            {
+                Ok(()) => {
+                    delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await?;
+                    sync.pods_by_session.remove(session_id);
+                    return delete_session_artifacts(
+                        sync.provider,
+                        &sync.secrets,
+                        session_id,
+                        &session_token_secret_name(session_id),
+                    )
+                    .await;
+                }
+                // Not ours any more (claim expired and moved on): the pod is an
+                // orphan either way.
+                Err(Error::ClaimConflict { .. }) => {}
+                Err(e) if e.is_not_found() => {
+                    return Err(anyhow::anyhow!(
+                        "session {session_id}: upstream has no startup-failure operation \
+                         (404); keeping the claim until it can take the report"
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e),
+            }
             teardown_session(sync, session_id).await
         }
         Action::ReplaceSucceededPod { session_id } => {
@@ -637,6 +680,17 @@ async fn recycle_unrestored_pod(
     sync.pods_by_session.remove(session_id);
     sync.snapshot_pending = true;
     Ok(true)
+}
+
+/// Keep the token secret as the retry handle until snapshot cleanup succeeds.
+async fn delete_session_artifacts(
+    provider: &dyn SnapshotProvider,
+    secrets: &Api<Secret>,
+    session_id: &str,
+    secret_name: &str,
+) -> crate::Result<()> {
+    provider.on_terminate(session_id).await?;
+    delete_ignoring_missing(secrets, secret_name).await
 }
 
 /// Delete the session's worker pod and token secret.
@@ -896,5 +950,196 @@ mod tests {
             prepare_status_patch(Some(&old), new, Duration::from_secs(30)),
             None
         );
+    }
+    #[tokio::test]
+    async fn startup_failure_cleanup_keeps_the_secret_as_the_retry_handle() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        use axum::extract::{Request, State};
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Json, Response};
+        use axum::routing::any;
+        use axum::{Router, serve};
+
+        #[derive(Clone, Default)]
+        struct Server {
+            report: Arc<AtomicU16>,
+            pvc: Arc<AtomicU16>,
+            calls: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        async fn handle(State(server): State<Server>, req: Request) -> Response {
+            let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+            server
+                .calls
+                .lock()
+                .unwrap()
+                .push((method.clone(), path.clone()));
+            let success = Json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Success"
+            }))
+            .into_response();
+            if method == "POST" && path.ends_with("/startup-failure") {
+                return StatusCode::from_u16(server.report.load(Ordering::SeqCst))
+                    .unwrap()
+                    .into_response();
+            }
+            if method == "DELETE" {
+                if path.contains("/pods/") || path.contains("/secrets/") {
+                    return success;
+                }
+                if path.contains("/persistentvolumeclaims/") {
+                    return match server.pvc.load(Ordering::SeqCst) {
+                        200 => success,
+                        code => StatusCode::from_u16(code).unwrap().into_response(),
+                    };
+                }
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
+
+        let server = Server::default();
+        let app = Router::new()
+            .route("/{*path}", any(handle))
+            .with_state(server.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http = tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let client = kube::Client::try_from(kube::Config::new(
+            format!("http://{address}").parse().unwrap(),
+        ))
+        .unwrap();
+        let pool = Arc::new(OutpostPool::new(
+            "p",
+            crate::crd::OutpostPoolSpec {
+                pool_id: "pool_x".to_string(),
+                token_secret_ref: crate::crd::SecretKeyRef {
+                    name: "t".to_string(),
+                    key: "token".to_string(),
+                },
+                api_url: Some(format!("http://{address}")),
+                max_concurrent_sessions: 1,
+                worker: crate::crd::WorkerTemplate {
+                    template: Default::default(),
+                    container_name: "devin-worker".to_string(),
+                    overrides: Default::default(),
+                },
+                resume: Default::default(),
+                image_build: None,
+            },
+        ));
+        let (trigger_tx, _trigger_rx) = futures::channel::mpsc::unbounded::<()>();
+        let ctx = Context::new(
+            client.clone(),
+            Arc::new(OperatorConfig::default()),
+            Arc::new(Metrics::default()),
+            Arc::new(PoolWatchers::new(trigger_tx)),
+        );
+        let outposts = OutpostsClient::new(format!("http://{address}"), "tok", "us").unwrap();
+        let provider =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), "ns");
+        let session_id = "s";
+        let action = Action::StartupFailed {
+            session_id: session_id.to_string(),
+            failure: crate::api::StartupFailure {
+                reason: crate::api::StartupFailureReason::ImagePullError,
+                image: Some("img:x".to_string()),
+                message: "pull failed".to_string(),
+            },
+        };
+        let mut sync = PoolSync {
+            pool: &pool,
+            ctx: &ctx,
+            outposts: &outposts,
+            provider: &provider,
+            pods: Api::namespaced(client.clone(), "ns"),
+            secrets: secrets.clone(),
+            pods_by_session: BTreeMap::new(),
+            snapshot_pending: false,
+        };
+        let calls = || server.calls.lock().unwrap().clone();
+        let pod_path = format!("/api/v1/namespaces/ns/pods/{}", worker_pod_name(session_id));
+        let pvc_path = format!(
+            "/api/v1/namespaces/default/persistentvolumeclaims/{}",
+            crate::controller::state_pvc_name(session_id)
+        );
+        let secret_path = format!(
+            "/api/v1/namespaces/ns/secrets/{}",
+            session_token_secret_name(session_id)
+        );
+        let report_path = format!("/opbeta/outposts/devins/{session_id}/startup-failure");
+
+        // Report refused upstream: nothing is torn down.
+        server.report.store(500, Ordering::SeqCst);
+        assert!(execute(&mut sync, &action).await.is_err());
+        assert_eq!(calls(), [("POST".to_string(), report_path.clone())]);
+
+        // Report conflict (claimed elsewhere): pod and secret go, artifacts
+        // stay — the PVC may belong to a new owner now.
+        server.report.store(409, Ordering::SeqCst);
+        server.calls.lock().unwrap().clear();
+        execute(&mut sync, &action).await.unwrap();
+        assert_eq!(
+            calls(),
+            [
+                ("POST".to_string(), report_path.clone()),
+                ("DELETE".to_string(), pod_path.clone()),
+                ("DELETE".to_string(), secret_path.clone())
+            ]
+        );
+
+        // Report accepted but PVC cleanup fails: pod is gone, the secret is
+        // kept, and the error propagates.
+        server.report.store(200, Ordering::SeqCst);
+        server.pvc.store(500, Ordering::SeqCst);
+        server.calls.lock().unwrap().clear();
+        assert!(execute(&mut sync, &action).await.is_err());
+        assert_eq!(
+            calls(),
+            [
+                ("POST".to_string(), report_path.clone()),
+                ("DELETE".to_string(), pod_path.clone()),
+                ("DELETE".to_string(), pvc_path.clone())
+            ]
+        );
+
+        // The retained secret drives a retry later: still failing PVC means
+        // still no secret deletion.
+        server.calls.lock().unwrap().clear();
+        assert!(
+            delete_session_artifacts(
+                &provider,
+                &secrets,
+                session_id,
+                &session_token_secret_name(session_id),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(calls(), [("DELETE".to_string(), pvc_path.clone())]);
+
+        // Once cleanup succeeds the secret goes too.
+        server.pvc.store(200, Ordering::SeqCst);
+        server.calls.lock().unwrap().clear();
+        delete_session_artifacts(
+            &provider,
+            &secrets,
+            session_id,
+            &session_token_secret_name(session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls(),
+            [
+                ("DELETE".to_string(), pvc_path.clone()),
+                ("DELETE".to_string(), secret_path.clone())
+            ]
+        );
+        http.abort();
     }
 }

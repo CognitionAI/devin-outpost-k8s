@@ -36,6 +36,20 @@
 //!   working). Past [`crate::config::OperatorConfig::worker_restart_limit`]
 //!   the operator gives up: release the claim + delete the pod so the session
 //!   isn't held hostage by a broken node/image.
+//! - Worker pod cannot start: an init or worker container's image fails to
+//!   pull, or the pod is unschedulable, for
+//!   [`crate::config::OperatorConfig::worker_startup_timeout`] (at once for
+//!   an image the kubelet will never pull) → report it through the queue's
+//!   `startup-failure` operation, which takes the attempt out of the queue
+//!   for good and shows the session's users why, then delete the pod,
+//!   snapshot artifacts and token secret once the server acknowledged.
+//!   Until then the claim stays counted and renewed, so a failed report
+//!   (including a server without the operation) neither frees the slot nor
+//!   lets the lease lapse. Never a
+//!   release: the next claim would hit the same image. Image pulls never
+//!   count as restarts, so the restart limit alone kept such claims renewing
+//!   forever. Initial startup only: a pull failure after the worker container
+//!   once ran is not judged this way.
 //! - Worker exits zero while the session is live → delete the pod; the next
 //!   pass recreates it with a freshly renewed connect token.
 //! - Pool deleted → [`POOL_FINALIZER`] releases in-flight claims (so sessions
@@ -59,7 +73,9 @@ mod queue_watch;
 mod reconcile;
 
 pub use context::Context;
-pub use plan::{Action, Observed, next_claim_deadline, plan, pod_restart_count};
+pub use plan::{
+    Action, Observed, next_claim_deadline, plan, pod_restart_count, pod_startup_failure,
+};
 pub use pod::{
     ANNOTATION_POOL_ID, ANNOTATION_SUSPENDED_AT, DEFAULT_STATIC_BASE_URL, DEFAULT_WORKER_IMAGE,
     ENV_GATEWAY_URL, ENV_REMOTE_BINARY_SHA, ENV_SESSION_TOKEN, ENV_STATIC_BASE_URL,

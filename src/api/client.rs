@@ -8,7 +8,10 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 
-use super::types::{DevinList, Outpost, OutpostDevin, OutpostList, Phase, WatchEvent};
+use super::types::{
+    DevinList, Outpost, OutpostDevin, OutpostList, Phase, StartupFailure, StartupFailureReason,
+    WatchEvent,
+};
 
 /// Timeout for plain JSON requests. Watch streams are long-lived and are not
 /// subject to it.
@@ -53,6 +56,14 @@ pub struct ListParams<'a> {
 #[derive(Serialize)]
 struct AcceptorBody<'a> {
     acceptor_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct StartupFailureBody<'a> {
+    acceptor_id: &'a str,
+    reason: StartupFailureReason,
+    image: Option<&'a str>,
+    message: &'a str,
 }
 
 impl OutpostsClient {
@@ -218,6 +229,36 @@ impl OutpostsClient {
             .timeout(REQUEST_TIMEOUT)
             .json(&AcceptorBody {
                 acceptor_id: &self.acceptor_id,
+            })
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            return Err(Error::ClaimConflict {
+                session_id: session_id.to_string(),
+            });
+        }
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    /// Report a startup failure; see [`crate::controller`] for the lifecycle.
+    ///
+    /// HTTP 409 (not claimed by this acceptor) maps to [`Error::ClaimConflict`].
+    pub async fn report_startup_failure(
+        &self,
+        session_id: &str,
+        failure: &StartupFailure,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/devins/{session_id}/startup-failure")))
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
+            .json(&StartupFailureBody {
+                acceptor_id: &self.acceptor_id,
+                reason: failure.reason,
+                image: failure.image.as_deref(),
+                message: &failure.message,
             })
             .send()
             .await?;

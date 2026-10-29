@@ -20,6 +20,41 @@ pub enum Phase {
     Unknown,
 }
 
+/// Why a worker pod could not start its session, as reported through
+/// [`crate::api::OutpostsClient::report_startup_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFailureReason {
+    /// The image was still being pulled (`ErrImagePull` / `ImagePullBackOff`)
+    /// when [`crate::config::OperatorConfig::worker_startup_timeout`] ran out.
+    ImagePullTimeout,
+    /// The kubelet will never be able to pull the image (`InvalidImageName`,
+    /// `ErrImageNeverPull`).
+    ImagePullError,
+    /// The pod was still unschedulable when the startup timeout ran out.
+    SchedulingTimeout,
+}
+
+impl StartupFailureReason {
+    /// The wire name, for status and log messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ImagePullTimeout => "image_pull_timeout",
+            Self::ImagePullError => "image_pull_error",
+            Self::SchedulingTimeout => "scheduling_timeout",
+        }
+    }
+}
+
+/// What a worker pod that could not start reported: the reason, the image it
+/// was waiting on (if the failure concerns one) and the kubelet's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupFailure {
+    pub reason: StartupFailureReason,
+    pub image: Option<String>,
+    pub message: String,
+}
+
 /// Whether a queued item is a brand new session or a resume of an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
