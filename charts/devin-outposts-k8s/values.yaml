@@ -56,6 +56,8 @@ operator:
   # account and stable for this install. Empty => the operator generates one and
   # persists it in a ConfigMap.
   acceptorId: ""
+  # -- WORKER_STARTUP_TIMEOUT_SECONDS; see OperatorConfig::worker_startup_timeout.
+  workerStartupTimeoutSeconds: 600
   # -- Default worker image when a pool does not pin one (worker.overrides.image).
   # Only the `stable` tag is supported; never pin a versioned tag.
   defaultWorkerImage: "public.ecr.aws/e0h8a4b6/devin-cli:stable"

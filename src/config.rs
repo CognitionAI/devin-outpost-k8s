@@ -53,11 +53,8 @@ pub struct OperatorConfig {
     /// delete the pod. See the lifecycle mapping in [`crate::controller`].
     pub worker_restart_limit: u32,
 
-    /// How long a worker pod may stay unschedulable, or keep failing to pull
-    /// an image (init or worker container), before the operator reports a
-    /// startup failure upstream and tears the pod down. Image pulls never
-    /// count as restarts, so without this a broken image kept the claim
-    /// renewing forever. See the lifecycle mapping in [`crate::controller`].
+    /// Initial startup deadline; see the lifecycle mapping in
+    /// [`crate::controller`].
     pub worker_startup_timeout: Duration,
 
     /// Whether, and through what, session network policies are enforced.

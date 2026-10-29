@@ -55,6 +55,8 @@ spec:
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
             - name: ACCEPTOR_ID
               value: {{ .Values.operator.acceptorId | quote }}
+            - name: WORKER_STARTUP_TIMEOUT_SECONDS
+              value: {{ .Values.operator.workerStartupTimeoutSeconds | quote }}
             # An unquoted `off` in a values file is a YAML boolean.
             - name: NETWORK_POLICY_PROVIDER
               value: {{ .Values.operator.networkPolicyProvider | toString | replace "false" "off" | quote }}

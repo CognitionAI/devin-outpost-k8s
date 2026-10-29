@@ -67,14 +67,8 @@ pub enum Action {
     /// The worker exceeded the restart limit: release the claim and tear the
     /// pod down so the session isn't held hostage by a broken node/image.
     GiveUp { session_id: String, restarts: u32 },
-    /// The worker pod cannot start (image pull or scheduling never completed,
-    /// see [`pod_startup_failure`]): report it upstream, which takes the
-    /// attempt out of the queue for good, then tear the pod down. Releasing
-    /// instead would hand the same unpullable image to the next claim. The
-    /// claim stays counted against `maxConcurrentSessions` and renewed
-    /// ([`Action::Renew`] is planned alongside) until the server has
-    /// acknowledged the failure: a report that fails must not free the slot
-    /// or let the lease lapse back into the queue.
+    /// Report a failure from [`pod_startup_failure`]; see
+    /// [`crate::controller`] for its lifecycle.
     StartupFailed {
         session_id: String,
         failure: StartupFailure,
@@ -114,14 +108,10 @@ const IMAGE_PULL_RETRYING_REASONS: [&str; 3] =
 /// Waiting reasons no retry fixes.
 const IMAGE_PULL_FATAL_REASONS: [&str; 2] = ["InvalidImageName", "ErrImageNeverPull"];
 
-/// Why the pod will not start on its own, if that is already certain: an
-/// image (of an init or worker container) that cannot be pulled, or an image
-/// pull or scheduling still pending `startup_timeout_secs` after the pod was
-/// created. None of these restart the container, so [`pod_restart_count`]
-/// never sees them. This covers initial startup only: once the worker
-/// container (`container_name`; sidecars don't count) has run, a pull
-/// failure on a later restart is not judged here, since the pod's age says
-/// nothing about how long that pull has been failing.
+/// Classify an initial startup failure using the pod's age and container
+/// states. Only the configured worker's history counts as having started; a
+/// sidecar must not suppress detection. See [`crate::controller`] for the
+/// lifecycle.
 pub fn pod_startup_failure(
     pod: &Pod,
     container_name: &str,

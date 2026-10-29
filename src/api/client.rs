@@ -241,10 +241,7 @@ impl OutpostsClient {
         Ok(())
     }
 
-    /// Report that the worker could not start the session's box, taking the
-    /// attempt out of the claimable queue for good (unlike [`Self::release`],
-    /// which hands it to the next worker). The server records the failure for
-    /// the session's users; a repeated report is idempotent.
+    /// Report a startup failure; see [`crate::controller`] for the lifecycle.
     ///
     /// HTTP 409 (not claimed by this acceptor) maps to [`Error::ClaimConflict`].
     pub async fn report_startup_failure(

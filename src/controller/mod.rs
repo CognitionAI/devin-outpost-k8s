@@ -41,10 +41,11 @@
 //!   [`crate::config::OperatorConfig::worker_startup_timeout`] (at once for
 //!   an image the kubelet will never pull) → report it through the queue's
 //!   `startup-failure` operation, which takes the attempt out of the queue
-//!   for good and shows the session's users why, then delete the pod +
-//!   secret once the server acknowledged. Until then the claim stays counted
-//!   and renewed, so a failed report (including a server without the
-//!   operation) neither frees the slot nor lets the lease lapse. Never a
+//!   for good and shows the session's users why, then delete the pod,
+//!   snapshot artifacts and token secret once the server acknowledged.
+//!   Until then the claim stays counted and renewed, so a failed report
+//!   (including a server without the operation) neither frees the slot nor
+//!   lets the lease lapse. Never a
 //!   release: the next claim would hit the same image. Image pulls never
 //!   count as restarts, so the restart limit alone kept such claims renewing
 //!   forever. Initial startup only: a pull failure after the worker container
