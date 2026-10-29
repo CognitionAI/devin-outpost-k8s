@@ -234,6 +234,7 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         acceptor_id: &acceptor_id,
         max_concurrent: pool.spec.max_concurrent_sessions,
         restart_limit: ctx.config.worker_restart_limit,
+        startup_timeout_secs: ctx.config.worker_startup_timeout.as_secs() as i64,
         renew_margin_secs: ctx.config.claim_renew_margin.as_secs() as i64,
         container_name: &pool.spec.worker.container_name,
         desired_image: pool
@@ -457,6 +458,43 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
                 .get_or_create(&pool_labels(sync.pool))
                 .inc();
             release_ignoring_conflict(sync.outposts, session_id).await?;
+            teardown_session(sync, session_id).await
+        }
+        Action::StartupFailed {
+            session_id,
+            failure,
+        } => {
+            warn!(
+                session = %session_id,
+                reason = failure.reason.as_str(),
+                image = failure.image.as_deref().unwrap_or(""),
+                message = %failure.message,
+                "worker cannot start; reporting the failure and giving the session up"
+            );
+            match sync
+                .outposts
+                .report_startup_failure(session_id, failure)
+                .await
+            {
+                Ok(()) => {}
+                // Not ours any more (claim expired and moved on): the pod is an
+                // orphan either way.
+                Err(Error::ClaimConflict { .. }) => {}
+                // A server that predates the startup-failure operation. Never
+                // release instead: that hands the same unpullable image to
+                // the next claim. The claim and pod stay (renewed and
+                // counted) until the server can take the report; if the
+                // session has in fact left the queue, the next pass sees no
+                // claim behind the pod and removes it as an orphan.
+                Err(e) if e.is_not_found() => {
+                    return Err(anyhow::anyhow!(
+                        "session {session_id}: upstream has no startup-failure operation \
+                         (404); keeping the claim until it can take the report"
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e),
+            }
             teardown_session(sync, session_id).await
         }
         Action::ReplaceSucceededPod { session_id } => {

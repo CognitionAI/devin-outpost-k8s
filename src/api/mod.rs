@@ -10,6 +10,9 @@
 //!   claim. Returns a `connect_token` + `gateway_url`. Re-claiming with the same
 //!   `acceptor_id` **renews** the claim (TTL ~5 min). `409` on conflict.
 //! - `POST   /.../devins/{id}/release`  — return a session to the queue.
+//! - `POST   /.../devins/{id}/startup-failure` — the claimed session's box
+//!   cannot start (e.g. its image does not pull): the attempt leaves the
+//!   queue for good and its users see why. `409` if not claimed by us.
 //! - `GET/POST/DELETE /.../outposts` — outpost CRUD (the prefix itself).
 //!
 //! Auth is a bearer **personal access token** with the `UseOutpostsMachine`

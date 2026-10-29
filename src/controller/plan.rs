@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Pod;
 
-use crate::api::{OutpostDevin, Phase, SessionStatus};
+use crate::api::{OutpostDevin, Phase, SessionStatus, StartupFailure, StartupFailureReason};
 
 use super::pod::effective_worker_image;
 
@@ -29,6 +29,10 @@ pub struct Observed<'a> {
     pub max_concurrent: u32,
     /// Give up on a worker restarted more than this many times.
     pub restart_limit: u32,
+    /// Report a worker pod still unschedulable or still failing to pull an
+    /// image after this long (seconds); see
+    /// [`crate::config::OperatorConfig::worker_startup_timeout`].
+    pub startup_timeout_secs: i64,
     /// Renew claims whose deadline is within this margin (seconds).
     pub renew_margin_secs: i64,
     /// Name of the worker container within the pod (`worker.containerName`).
@@ -63,6 +67,18 @@ pub enum Action {
     /// The worker exceeded the restart limit: release the claim and tear the
     /// pod down so the session isn't held hostage by a broken node/image.
     GiveUp { session_id: String, restarts: u32 },
+    /// The worker pod cannot start (image pull or scheduling never completed,
+    /// see [`pod_startup_failure`]): report it upstream, which takes the
+    /// attempt out of the queue for good, then tear the pod down. Releasing
+    /// instead would hand the same unpullable image to the next claim. The
+    /// claim stays counted against `maxConcurrentSessions` and renewed
+    /// ([`Action::Renew`] is planned alongside) until the server has
+    /// acknowledged the failure: a report that fails must not free the slot
+    /// or let the lease lapse back into the queue.
+    StartupFailed {
+        session_id: String,
+        failure: StartupFailure,
+    },
     /// The worker pod completed while its session is still live: delete it;
     /// the next pass recreates it via [`Action::StartWorker`].
     ReplaceSucceededPod { session_id: String },
@@ -88,6 +104,99 @@ pub fn pod_restart_count(pod: &Pod) -> u32 {
         .flatten()
         .map(|cs| cs.restart_count.max(0) as u32)
         .sum()
+}
+
+/// Waiting reasons the kubelet retries with backoff; given up on only after
+/// the startup timeout. `ImageInspectError` is a failed runtime call, which
+/// can be transient, not a verdict on the image.
+const IMAGE_PULL_RETRYING_REASONS: [&str; 3] =
+    ["ErrImagePull", "ImagePullBackOff", "ImageInspectError"];
+/// Waiting reasons no retry fixes.
+const IMAGE_PULL_FATAL_REASONS: [&str; 2] = ["InvalidImageName", "ErrImageNeverPull"];
+
+/// Why the pod will not start on its own, if that is already certain: an
+/// image (of an init or worker container) that cannot be pulled, or an image
+/// pull or scheduling still pending `startup_timeout_secs` after the pod was
+/// created. None of these restart the container, so [`pod_restart_count`]
+/// never sees them. This covers initial startup only: once the worker
+/// container (`container_name`; sidecars don't count) has run, a pull
+/// failure on a later restart is not judged here, since the pod's age says
+/// nothing about how long that pull has been failing.
+pub fn pod_startup_failure(
+    pod: &Pod,
+    container_name: &str,
+    now: i64,
+    startup_timeout_secs: i64,
+) -> Option<StartupFailure> {
+    let status = pod.status.as_ref()?;
+    let worker_ran = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .filter(|cs| cs.name == container_name)
+        .any(|cs| {
+            cs.restart_count > 0
+                || cs
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| s.running.is_some() || s.terminated.is_some())
+                || cs
+                    .last_state
+                    .as_ref()
+                    .is_some_and(|s| s.terminated.is_some())
+        });
+    if worker_ran {
+        return None;
+    }
+    let timed_out = pod
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .is_some_and(|created| now - created.0.as_second() >= startup_timeout_secs);
+    let waiting = status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .filter_map(|cs| {
+            let waiting = cs.state.as_ref()?.waiting.as_ref()?;
+            Some((cs, waiting.reason.as_deref()?, waiting.message.as_deref()))
+        });
+    for (cs, reason, message) in waiting {
+        let failure = |kind| StartupFailure {
+            reason: kind,
+            image: Some(cs.image.clone()).filter(|image| !image.is_empty()),
+            message: match message {
+                Some(message) => format!("{reason}: {message}"),
+                None => reason.to_string(),
+            },
+        };
+        if IMAGE_PULL_FATAL_REASONS.contains(&reason) {
+            return Some(failure(StartupFailureReason::ImagePullError));
+        }
+        if timed_out && IMAGE_PULL_RETRYING_REASONS.contains(&reason) {
+            return Some(failure(StartupFailureReason::ImagePullTimeout));
+        }
+    }
+    if timed_out && status.phase.as_deref() == Some("Pending") {
+        let unscheduled = status
+            .conditions
+            .iter()
+            .flatten()
+            .find(|c| c.type_ == "PodScheduled" && c.status == "False")?;
+        return Some(StartupFailure {
+            reason: StartupFailureReason::SchedulingTimeout,
+            image: None,
+            message: match (&unscheduled.reason, &unscheduled.message) {
+                (Some(reason), Some(message)) => format!("{reason}: {message}"),
+                (reason, message) => reason
+                    .clone()
+                    .or_else(|| message.clone())
+                    .unwrap_or_else(|| "Unschedulable".to_string()),
+            },
+        });
+    }
+    None
 }
 
 fn pod_succeeded(pod: &Pod) -> bool {
@@ -158,7 +267,26 @@ pub fn plan(observed: &Observed<'_>) -> Vec<Action> {
             }
             Some(pod) => {
                 let restarts = pod_restart_count(pod);
-                if restarts > observed.restart_limit {
+                if let Some(failure) = pod_startup_failure(
+                    pod,
+                    observed.container_name,
+                    observed.now,
+                    observed.startup_timeout_secs,
+                ) {
+                    if session
+                        .status
+                        .claim_deadline
+                        .is_none_or(|deadline| deadline - observed.now < observed.renew_margin_secs)
+                    {
+                        actions.push(Action::Renew {
+                            session_id: session_id.clone(),
+                        });
+                    }
+                    actions.push(Action::StartupFailed {
+                        session_id,
+                        failure,
+                    });
+                } else if restarts > observed.restart_limit {
                     actions.push(Action::GiveUp {
                         session_id,
                         restarts,
@@ -313,12 +441,50 @@ mod tests {
             acceptor_id: US,
             max_concurrent: 2,
             restart_limit: 3,
+            startup_timeout_secs: STARTUP_TIMEOUT,
             renew_margin_secs: 60,
             container_name: "devin-worker",
             desired_image: "img:current",
             build_image: None,
-            now: 0,
+            now: NOW,
         }
+    }
+
+    const NOW: i64 = 0;
+    const STARTUP_TIMEOUT: i64 = 600;
+
+    fn created_at(unix_secs: i64) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(unix_secs).unwrap(),
+        )
+    }
+
+    /// A pod created `age_secs` before [`NOW`] whose `container` (an init
+    /// container when `init`) waits with `reason`.
+    fn waiting_pod(age_secs: i64, init: bool, reason: &str, image: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting};
+
+        let status = ContainerStatus {
+            name: "devin-worker".to_string(),
+            image: image.to_string(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some(reason.to_string()),
+                    message: Some("rpc error: manifest unknown".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut pod = pod("Pending", 0);
+        pod.metadata.creation_timestamp = Some(created_at(NOW - age_secs));
+        let pod_status = pod.status.as_mut().unwrap();
+        if init {
+            pod_status.init_container_statuses = Some(vec![status]);
+        } else {
+            pod_status.container_statuses = Some(vec![status]);
+        }
+        pod
     }
 
     fn pod_with_image(phase: &str, restarts: i32, ready: bool, image: &str) -> Pod {
@@ -443,6 +609,210 @@ mod tests {
         assert!(actions.contains(&Action::Claim {
             session_id: "waiting".into()
         }));
+    }
+
+    #[test]
+    fn reports_image_pulls_still_failing_past_the_startup_timeout() {
+        let sessions = vec![
+            session("stuck", 1, Phase::Claimed, SessionStatus::Running),
+            session("healthy", 1, Phase::Claimed, SessionStatus::Running),
+            session("waiting", 2, Phase::Pending, SessionStatus::Pending),
+        ];
+        for init in [false, true] {
+            let pods = BTreeMap::from([
+                (
+                    "stuck".to_string(),
+                    waiting_pod(STARTUP_TIMEOUT, init, "ImagePullBackOff", "img:missing"),
+                ),
+                ("healthy".to_string(), pod("Running", 0)),
+            ]);
+            let actions = plan(&observed(&sessions, &pods, &[]));
+            assert!(
+                actions.contains(&Action::StartupFailed {
+                    session_id: "stuck".into(),
+                    failure: StartupFailure {
+                        reason: StartupFailureReason::ImagePullTimeout,
+                        image: Some("img:missing".into()),
+                        message: "ImagePullBackOff: rpc error: manifest unknown".into(),
+                    },
+                }),
+                "init={init}: {actions:?}"
+            );
+            // The slot is not freed until the server has acknowledged the
+            // failure: with "stuck" still counted the pool is full, so
+            // "waiting" is not claimed in the same pass.
+            assert!(!actions.contains(&Action::Claim {
+                session_id: "waiting".into()
+            }));
+        }
+    }
+
+    #[test]
+    fn keeps_renewing_a_claim_whose_startup_failure_is_being_reported() {
+        let mut stuck = session("stuck", 1, Phase::Claimed, SessionStatus::Running);
+        stuck.status.claim_deadline = Some(NOW + 30);
+        let sessions = vec![stuck];
+        let pods = BTreeMap::from([(
+            "stuck".to_string(),
+            waiting_pod(STARTUP_TIMEOUT, false, "ImagePullBackOff", "img:missing"),
+        )]);
+        let actions = plan(&observed(&sessions, &pods, &[]));
+        // Renew comes first so a failed report cannot let the lease lapse
+        // and put the session back in the queue.
+        assert!(matches!(
+            &actions[..],
+            [Action::Renew { session_id: renewed }, Action::StartupFailed { session_id, .. }]
+                if renewed == "stuck" && session_id == "stuck"
+        ));
+    }
+
+    #[test]
+    fn a_pull_failure_after_the_worker_ran_is_not_a_startup_failure() {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated};
+
+        let sessions = vec![session("old", 1, Phase::Claimed, SessionStatus::Running)];
+        let mut pod = waiting_pod(
+            STARTUP_TIMEOUT * 10,
+            false,
+            "ImagePullBackOff",
+            "img:current",
+        );
+        pod.spec = pod_with_image("Running", 1, false, "img:current").spec;
+        let cs = &mut pod
+            .status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0];
+        cs.restart_count = 1;
+        cs.last_state = Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Not judged as a startup failure: the pod's age is not how long
+        // this pull has failed.
+        assert_eq!(
+            plan(&observed(&sessions, &pods_of("old", pod), &[])),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_running_sidecar_does_not_hide_a_worker_that_never_started() {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateRunning};
+
+        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
+        let mut pod = waiting_pod(STARTUP_TIMEOUT, false, "ImagePullBackOff", "img:missing");
+        pod.status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()
+            .push(ContainerStatus {
+                name: "log-shipper".to_string(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(matches!(
+            &plan(&observed(&sessions, &pods_of("s", pod), &[]))[..],
+            [Action::StartupFailed { session_id, failure }]
+                if session_id == "s" && failure.reason == StartupFailureReason::ImagePullTimeout
+        ));
+    }
+
+    #[test]
+    fn image_inspect_errors_get_the_retry_window() {
+        let sessions = vec![session("s", 1, Phase::Claimed, SessionStatus::Running)];
+        let fresh = waiting_pod(1, false, "ImageInspectError", "img:x");
+        assert_eq!(
+            plan(&observed(&sessions, &pods_of("s", fresh), &[])),
+            vec![]
+        );
+        let stale = waiting_pod(STARTUP_TIMEOUT, false, "ImageInspectError", "img:x");
+        assert!(matches!(
+            &plan(&observed(&sessions, &pods_of("s", stale), &[]))[..],
+            [Action::StartupFailed { failure, .. }]
+                if failure.reason == StartupFailureReason::ImagePullTimeout
+        ));
+    }
+
+    fn pods_of(session_id: &str, pod: Pod) -> BTreeMap<String, Pod> {
+        BTreeMap::from([(session_id.to_string(), pod)])
+    }
+
+    #[test]
+    fn leaves_an_image_pull_alone_within_the_startup_timeout() {
+        let sessions = vec![session(
+            "pulling",
+            1,
+            Phase::Claimed,
+            SessionStatus::Running,
+        )];
+        let pods = BTreeMap::from([(
+            "pulling".to_string(),
+            waiting_pod(STARTUP_TIMEOUT - 1, false, "ErrImagePull", "img:slow"),
+        )]);
+        // Nothing to do yet (the claim is far from its deadline): the pod
+        // is left to the kubelet's pull retries.
+        assert_eq!(plan(&observed(&sessions, &pods, &[])), vec![]);
+    }
+
+    #[test]
+    fn reports_unpullable_images_without_waiting() {
+        let sessions = vec![session("bad", 1, Phase::Claimed, SessionStatus::Running)];
+        let pods = BTreeMap::from([(
+            "bad".to_string(),
+            waiting_pod(1, true, "InvalidImageName", "IMG:Bad"),
+        )]);
+        let actions = plan(&observed(&sessions, &pods, &[]));
+        assert!(matches!(
+            &actions[..],
+            [Action::StartupFailed { session_id, failure }]
+                if session_id == "bad" && failure.reason == StartupFailureReason::ImagePullError
+        ));
+    }
+
+    #[test]
+    fn reports_pods_still_unschedulable_past_the_startup_timeout() {
+        use k8s_openapi::api::core::v1::PodCondition;
+
+        let sessions = vec![session(
+            "nowhere",
+            1,
+            Phase::Claimed,
+            SessionStatus::Running,
+        )];
+        let mut pod = pod("Pending", 0);
+        pod.metadata.creation_timestamp = Some(created_at(NOW - STARTUP_TIMEOUT));
+        let status = pod.status.as_mut().unwrap();
+        status.container_statuses = None;
+        status.conditions = Some(vec![PodCondition {
+            type_: "PodScheduled".into(),
+            status: "False".into(),
+            reason: Some("Unschedulable".into()),
+            message: Some("0/3 nodes are available".into()),
+            ..Default::default()
+        }]);
+        let pods = BTreeMap::from([("nowhere".to_string(), pod)]);
+        assert_eq!(
+            plan(&observed(&sessions, &pods, &[])),
+            vec![Action::StartupFailed {
+                session_id: "nowhere".into(),
+                failure: StartupFailure {
+                    reason: StartupFailureReason::SchedulingTimeout,
+                    image: None,
+                    message: "Unschedulable: 0/3 nodes are available".into(),
+                },
+            }]
+        );
     }
 
     #[test]
