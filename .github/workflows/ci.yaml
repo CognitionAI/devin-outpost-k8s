@@ -25,6 +25,8 @@ jobs:
         run: cargo check --all-targets
       - name: test
         run: cargo test
+      - name: image-paths inventory script tests
+        run: python3 -m unittest discover -s tests -p 'test_image_paths.py'
       - name: crd is up to date
         run: |
           cargo run --bin crdgen > /tmp/crd.json
