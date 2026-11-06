@@ -59,7 +59,10 @@
 //!   with the pool's registry credential, the base image and
 //!   `spec.image_target`; it pushes what the capture puts in the directory.
 //!   The worker, where the customer's blueprints run with sudo, never sees
-//!   the credential or the target.
+//!   the credential or the target. Such an image also needs `python3`: the
+//!   capture runs on it, and so does [`BASE_IMAGE_PATHS_CONTAINER_NAME`], which
+//!   records the image's paths before the worker can create any, so that only
+//!   deletions of those paths become whiteouts.
 
 use std::collections::BTreeMap;
 
@@ -104,7 +107,7 @@ pub const DEFAULT_STATIC_BASE_URL: &str = "https://static.devin.ai/devin-rs/remo
 pub const ENV_HOME: &str = "HOME";
 /// Push sidecar of an image-build pod (see [`crate::image_push`]).
 pub const PUSH_SIDECAR_CONTAINER_NAME: &str = "devin-image-push";
-const BASE_IMAGE_PATHS_CONTAINER_NAME: &str = "devin-base-image-paths";
+pub const BASE_IMAGE_PATHS_CONTAINER_NAME: &str = "devin-base-image-paths";
 const LAYER_VOLUME_NAME: &str = "drs-layer";
 
 /// Subdirectory of the home volume holding the worker's binary cache and
@@ -488,10 +491,12 @@ fn push_sidecar_container(
     })
 }
 
-fn base_image_paths_container(image: &str) -> Container {
+fn base_image_paths_container(worker: &Container) -> Container {
     Container {
         name: BASE_IMAGE_PATHS_CONTAINER_NAME.to_string(),
-        image: Some(image.to_string()),
+        image: worker.image.clone(),
+        // A different pull policy could inventory another revision of a mutable tag.
+        image_pull_policy: worker.image_pull_policy.clone(),
         command: Some(vec![
             "python3".to_string(),
             "-c".to_string(),
@@ -697,7 +702,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         });
         spec.init_containers
             .get_or_insert_default()
-            .extend([base_image_paths_container(image), sidecar]);
+            .extend([base_image_paths_container(container), sidecar]);
     }
     let env = container.env.get_or_insert_default();
     env.retain(|e| operator_env.iter().all(|o| o.name != e.name));
@@ -943,6 +948,17 @@ mod tests {
                 .collect()
         }
         let mut pool = pool();
+        pool.spec
+            .worker
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .containers
+            .iter_mut()
+            .find(|container| container.name == pool.spec.worker.container_name)
+            .unwrap()
+            .image_pull_policy = Some("Always".to_string());
         pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
             registry_secret_name: Some("registry-push".to_string()),
             ..Default::default()
@@ -961,6 +977,7 @@ mod tests {
         let pod = build_worker_pod(params(&pool, &build)).unwrap();
         let spec = pod.spec.unwrap();
         let worker = &spec.containers[0];
+        assert_eq!(worker.image_pull_policy.as_deref(), Some("Always"));
         let worker_env = drs_env(worker);
         // The worker knows the shared directory and nothing else.
         assert_eq!(
@@ -974,6 +991,10 @@ mod tests {
         assert_eq!(
             inventory.image.as_deref(),
             spec.containers[0].image.as_deref()
+        );
+        assert_eq!(
+            inventory.image_pull_policy.as_deref(),
+            worker.image_pull_policy.as_deref()
         );
         assert!(inventory.restart_policy.is_none());
         let inventory_security = inventory.security_context.as_ref().unwrap();
