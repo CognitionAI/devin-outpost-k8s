@@ -59,7 +59,10 @@
 //!   with the pool's registry credential, the base image and
 //!   `spec.image_target`; it pushes what the capture puts in the directory.
 //!   The worker, where the customer's blueprints run with sudo, never sees
-//!   the credential or the target.
+//!   the credential or the target. Before the worker starts,
+//!   [`BASE_IMAGE_PATHS_CONTAINER_NAME`] inventories the image using `sh` and
+//!   `find` (with `-print0` support), so that only deletions of base-image paths
+//!   become whiteouts.
 
 use std::collections::BTreeMap;
 
@@ -104,6 +107,7 @@ pub const DEFAULT_STATIC_BASE_URL: &str = "https://static.devin.ai/devin-rs/remo
 pub const ENV_HOME: &str = "HOME";
 /// Push sidecar of an image-build pod (see [`crate::image_push`]).
 pub const PUSH_SIDECAR_CONTAINER_NAME: &str = "devin-image-push";
+pub const BASE_IMAGE_PATHS_CONTAINER_NAME: &str = "devin-base-image-paths";
 const LAYER_VOLUME_NAME: &str = "drs-layer";
 
 /// Subdirectory of the home volume holding the worker's binary cache and
@@ -487,6 +491,32 @@ fn push_sidecar_container(
     })
 }
 
+fn base_image_paths_container(worker: &Container) -> Container {
+    Container {
+        name: BASE_IMAGE_PATHS_CONTAINER_NAME.to_string(),
+        image: worker.image.clone(),
+        // A different pull policy could inventory another revision of a mutable tag.
+        image_pull_policy: worker.image_pull_policy.clone(),
+        command: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            include_str!("image_paths.sh").to_string(),
+            BASE_IMAGE_PATHS_CONTAINER_NAME.to_string(),
+            "/".to_string(),
+            format!("{}/base-paths.nul", image_push::LAYER_DIR),
+        ]),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            run_as_non_root: Some(false),
+            allow_privilege_escalation: Some(false),
+            read_only_root_filesystem: Some(true),
+            ..Default::default()
+        }),
+        volume_mounts: Some(vec![layer_volume_mount()]),
+        ..Default::default()
+    }
+}
+
 fn session_image_override<'a>(
     session: &'a OutpostDevin,
     build_image: Option<&'a str>,
@@ -671,7 +701,9 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
-        spec.init_containers.get_or_insert_default().push(sidecar);
+        spec.init_containers
+            .get_or_insert_default()
+            .extend([base_image_paths_container(container), sidecar]);
     }
     let env = container.env.get_or_insert_default();
     env.retain(|e| operator_env.iter().all(|o| o.name != e.name));
@@ -917,6 +949,17 @@ mod tests {
                 .collect()
         }
         let mut pool = pool();
+        pool.spec
+            .worker
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .containers
+            .iter_mut()
+            .find(|container| container.name == pool.spec.worker.container_name)
+            .unwrap()
+            .image_pull_policy = Some("Always".to_string());
         pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
             registry_secret_name: Some("registry-push".to_string()),
             ..Default::default()
@@ -935,6 +978,7 @@ mod tests {
         let pod = build_worker_pod(params(&pool, &build)).unwrap();
         let spec = pod.spec.unwrap();
         let worker = &spec.containers[0];
+        assert_eq!(worker.image_pull_policy.as_deref(), Some("Always"));
         let worker_env = drs_env(worker);
         // The worker knows the shared directory and nothing else.
         assert_eq!(
@@ -942,8 +986,38 @@ mod tests {
             [image_push::ENV_LAYER_DIR]
         );
 
+        let init = spec.init_containers.as_ref().unwrap();
+        let inventory = &init[0];
+        assert_eq!(inventory.name, BASE_IMAGE_PATHS_CONTAINER_NAME);
+        assert_eq!(
+            inventory.image.as_deref(),
+            spec.containers[0].image.as_deref()
+        );
+        assert_eq!(
+            inventory.image_pull_policy.as_deref(),
+            worker.image_pull_policy.as_deref()
+        );
+        assert!(inventory.restart_policy.is_none());
+        let inventory_security = inventory.security_context.as_ref().unwrap();
+        assert_eq!(inventory_security.run_as_user, Some(0));
+        assert_eq!(inventory_security.run_as_non_root, Some(false));
+        assert_eq!(inventory_security.allow_privilege_escalation, Some(false));
+        assert_eq!(inventory_security.read_only_root_filesystem, Some(true));
+        assert!(inventory.env.is_none());
+        let inventory_mounts = inventory.volume_mounts.as_ref().unwrap();
+        assert_eq!(inventory_mounts.len(), 1);
+        assert_eq!(inventory_mounts[0].name, LAYER_VOLUME_NAME);
+        assert_eq!(inventory_mounts[0].mount_path, image_push::LAYER_DIR);
+        let inventory_command = inventory.command.as_ref().unwrap();
+        assert_eq!(inventory_command[0], "sh");
+        assert_eq!(inventory_command[1], "-c");
+        assert_eq!(inventory_command[3], BASE_IMAGE_PATHS_CONTAINER_NAME);
+        assert_eq!(inventory_command[4], "/");
+        assert!(inventory_command[5].starts_with(image_push::LAYER_DIR));
+
         // The sidecar is the operator image, as root, with everything else.
-        let sidecar = &spec.init_containers.as_ref().unwrap()[0];
+        let sidecar = &init[1];
+        assert_eq!(sidecar.name, PUSH_SIDECAR_CONTAINER_NAME);
         let operator_image = params(&pool, &build).operator_image;
         assert_eq!(sidecar.image.as_deref(), operator_image);
         assert_eq!(sidecar.restart_policy.as_deref(), Some("Always"));
@@ -997,7 +1071,14 @@ mod tests {
             let pod = build_worker_pod(params(&pool, &build)).unwrap();
             let spec = pod.spec.unwrap();
             assert_eq!(spec.containers[0].image.as_deref(), Some(expected));
-            let sidecar_env = drs_env(&spec.init_containers.as_ref().unwrap()[0]);
+            let init = spec.init_containers.as_ref().unwrap();
+            assert_eq!(init[0].name, BASE_IMAGE_PATHS_CONTAINER_NAME);
+            assert_eq!(init[0].image.as_deref(), Some(expected));
+            let sidecar = init
+                .iter()
+                .find(|c| c.name == PUSH_SIDECAR_CONTAINER_NAME)
+                .unwrap();
+            let sidecar_env = drs_env(sidecar);
             assert_eq!(
                 sidecar_env[image_push::ENV_BASE_IMAGE].value.as_deref(),
                 Some(expected)
@@ -1382,6 +1463,25 @@ mod tests {
                 .find(|c| c.name == "devin-worker")
                 .unwrap();
             assert_eq!(worker.image.as_deref(), Some(expected));
+
+            let inventory = spec
+                .init_containers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.name == BASE_IMAGE_PATHS_CONTAINER_NAME);
+            if image_build {
+                let inventory = inventory.unwrap();
+                assert_eq!(inventory.image.as_deref(), Some(expected));
+                let inventory_security = inventory.security_context.as_ref().unwrap();
+                assert_eq!(inventory_security.run_as_user, Some(0));
+                assert_eq!(inventory_security.run_as_non_root, Some(false));
+                let mounts = inventory.volume_mounts.as_ref().unwrap();
+                assert_eq!(mounts.len(), 1);
+                assert_eq!(mounts[0].name, LAYER_VOLUME_NAME);
+            } else {
+                assert!(inventory.is_none());
+            }
 
             // The seed runs the session image and writes to the volume the
             // worker mounts as home, at a path that leaves the image's home
