@@ -59,10 +59,10 @@
 //!   with the pool's registry credential, the base image and
 //!   `spec.image_target`; it pushes what the capture puts in the directory.
 //!   The worker, where the customer's blueprints run with sudo, never sees
-//!   the credential or the target. Such an image also needs `python3`: the
-//!   capture runs on it, and so does [`BASE_IMAGE_PATHS_CONTAINER_NAME`], which
-//!   records the image's paths before the worker can create any, so that only
-//!   deletions of those paths become whiteouts.
+//!   the credential or the target. Before the worker starts,
+//!   [`BASE_IMAGE_PATHS_CONTAINER_NAME`] inventories the image using `sh` and
+//!   `find` (with `-print0` support), so that only deletions of base-image paths
+//!   become whiteouts.
 
 use std::collections::BTreeMap;
 
@@ -498,11 +498,12 @@ fn base_image_paths_container(worker: &Container) -> Container {
         // A different pull policy could inventory another revision of a mutable tag.
         image_pull_policy: worker.image_pull_policy.clone(),
         command: Some(vec![
-            "python3".to_string(),
+            "sh".to_string(),
             "-c".to_string(),
-            include_str!("image_paths.py").to_string(),
+            include_str!("image_paths.sh").to_string(),
+            BASE_IMAGE_PATHS_CONTAINER_NAME.to_string(),
             "/".to_string(),
-            format!("{}/base-paths.json", image_push::LAYER_DIR),
+            format!("{}/base-paths.nul", image_push::LAYER_DIR),
         ]),
         security_context: Some(SecurityContext {
             run_as_user: Some(0),
@@ -1008,10 +1009,11 @@ mod tests {
         assert_eq!(inventory_mounts[0].name, LAYER_VOLUME_NAME);
         assert_eq!(inventory_mounts[0].mount_path, image_push::LAYER_DIR);
         let inventory_command = inventory.command.as_ref().unwrap();
-        assert_eq!(inventory_command[0], "python3");
+        assert_eq!(inventory_command[0], "sh");
         assert_eq!(inventory_command[1], "-c");
-        assert_eq!(inventory_command[3], "/");
-        assert!(inventory_command[4].starts_with(image_push::LAYER_DIR));
+        assert_eq!(inventory_command[3], BASE_IMAGE_PATHS_CONTAINER_NAME);
+        assert_eq!(inventory_command[4], "/");
+        assert!(inventory_command[5].starts_with(image_push::LAYER_DIR));
 
         // The sidecar is the operator image, as root, with everything else.
         let sidecar = &init[1];
