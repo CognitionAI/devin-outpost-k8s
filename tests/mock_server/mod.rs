@@ -45,6 +45,7 @@ pub struct Row {
     pub updated_at: f64,
     pub deleted_at: Option<f64>,
     pub claim_count: u64,
+    pub requester: Option<serde_json::Value>,
 }
 
 struct QueueState {
@@ -155,7 +156,19 @@ impl MockQueue {
             updated_at: ts,
             deleted_at: None,
             claim_count: 0,
+            requester: None,
         });
+    }
+
+    /// Replace a row's `metadata.requester` verbatim.
+    pub fn set_requester(&self, session_id: &str, requester: serde_json::Value) {
+        let mut state = self.state.lock().unwrap();
+        let row = state
+            .rows
+            .iter_mut()
+            .find(|r| r.session_id == session_id)
+            .expect("unknown session");
+        row.requester = Some(requester);
     }
 
     pub fn set_session_status(&self, session_id: &str, status: &str) {
@@ -255,6 +268,7 @@ fn row_json(row: &Row) -> serde_json::Value {
             "outpost_id": row.pool_id,
             "created_at": row.created_at as i64,
             "updated_at": row.updated_at as i64,
+            "requester": row.requester,
         },
         "spec": {
             "kind": row.kind,
