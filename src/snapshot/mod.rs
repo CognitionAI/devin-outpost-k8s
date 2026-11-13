@@ -111,6 +111,9 @@ pub trait SnapshotProvider: Send + Sync {
         pod: &k8s_openapi::api::core::v1::Pod,
     ) -> Result<SnapshotOutcome>;
 
+    /// The queue row vanished with no terminal status: keep the state for a
+    /// resume and start its retention clock.
+    async fn on_vanish(&self, session_id: &str) -> Result<()>;
     /// Delete per-session artifacts once the session is terminated.
     async fn on_terminate(&self, session_id: &str) -> Result<()>;
 

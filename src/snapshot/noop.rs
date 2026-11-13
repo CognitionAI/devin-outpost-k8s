@@ -32,6 +32,10 @@ impl SnapshotProvider for NoopSnapshotProvider {
         Ok(SnapshotOutcome::Ready)
     }
 
+    async fn on_vanish(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn on_terminate(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }

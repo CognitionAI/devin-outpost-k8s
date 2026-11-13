@@ -43,6 +43,20 @@ impl FilesystemSnapshotProvider {
             self.pool.meta().namespace.as_deref().unwrap_or("default"),
         )
     }
+
+    async fn mark_suspended(&self, pvc_name: &str) -> Result<()> {
+        let patch = serde_json::json!({
+            "metadata": {
+                "annotations": {
+                    ANNOTATION_SUSPENDED_AT: chrono::Utc::now().to_rfc3339(),
+                }
+            }
+        });
+        self.pvcs()
+            .patch(pvc_name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -91,21 +105,19 @@ impl SnapshotProvider for FilesystemSnapshotProvider {
         session_id: &str,
         _pod: &k8s_openapi::api::core::v1::Pod,
     ) -> Result<SnapshotOutcome> {
-        let patch = serde_json::json!({
-            "metadata": {
-                "annotations": {
-                    ANNOTATION_SUSPENDED_AT: chrono::Utc::now().to_rfc3339(),
-                }
-            }
-        });
-        self.pvcs()
-            .patch(
-                &state_pvc_name(session_id),
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            )
-            .await?;
+        self.mark_suspended(&state_pvc_name(session_id)).await?;
         Ok(SnapshotOutcome::Ready)
+    }
+
+    /// Start the TTL clock unless a suspend already did.
+    async fn on_vanish(&self, session_id: &str) -> Result<()> {
+        let name = state_pvc_name(session_id);
+        match self.pvcs().get_opt(&name).await? {
+            Some(pvc) if !pvc.annotations().contains_key(ANNOTATION_SUSPENDED_AT) => {
+                self.mark_suspended(&name).await
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn on_terminate(&self, session_id: &str) -> Result<()> {

@@ -320,7 +320,8 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
     }
     let snapshot_pending = sync.snapshot_pending;
 
-    // Cleanup: token secrets whose session no longer exists in the queue.
+    // Cleanup: token secrets whose session left the queue; its state stays
+    // for a resume (`on_vanish`).
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
     let selector = format!("{LABEL_POOL}={}", pool.name_any());
     let expected_secrets: Vec<String> = sessions
@@ -334,9 +335,16 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         let name = secret.name_any();
         if !expected_secrets.contains(&name) {
             let result = match secret.labels().get(super::LABEL_SESSION_ID) {
-                Some(session_id) => {
-                    delete_session_artifacts(provider.as_ref(), &secrets, session_id, &name).await
-                }
+                Some(session_id) => match secret.annotations().get(ANNOTATION_CLEANUP_INTENT) {
+                    Some(raw) => match serde_json::from_str::<CleanupIntent>(raw) {
+                        Ok(intent) => finish_cleanup(&mut sync, session_id, intent).await,
+                        Err(err) => Err(err.into()),
+                    },
+                    None => {
+                        retire_vanished_session(provider.as_ref(), &secrets, session_id, &name)
+                            .await
+                    }
+                },
                 None => delete_ignoring_missing(&secrets, &name).await,
             };
             if let Err(err) = result {
@@ -423,9 +431,8 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
             release_ignoring_conflict(sync.outposts, session_id).await
         }
         Action::Terminate { session_id } => {
-            release_ignoring_conflict(sync.outposts, session_id).await?;
-            teardown_session(sync, session_id).await?;
-            sync.provider.on_terminate(session_id).await
+            mark_cleanup_intent(sync, session_id, &CleanupIntent::Terminate).await?;
+            finish_cleanup(sync, session_id, CleanupIntent::Terminate).await
         }
         Action::GiveUp {
             session_id,
@@ -472,35 +479,9 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
                 message = %failure.message,
                 "worker cannot start; reporting the failure and giving the session up"
             );
-            match sync
-                .outposts
-                .report_startup_failure(session_id, failure)
-                .await
-            {
-                Ok(()) => {
-                    delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await?;
-                    sync.pods_by_session.remove(session_id);
-                    return delete_session_artifacts(
-                        sync.provider,
-                        &sync.secrets,
-                        session_id,
-                        &session_token_secret_name(session_id),
-                    )
-                    .await;
-                }
-                // Not ours any more (claim expired and moved on): the pod is an
-                // orphan either way.
-                Err(Error::ClaimConflict { .. }) => {}
-                Err(e) if e.is_not_found() => {
-                    return Err(anyhow::anyhow!(
-                        "session {session_id}: upstream has no startup-failure operation \
-                         (404); keeping the claim until it can take the report"
-                    )
-                    .into());
-                }
-                Err(e) => return Err(e),
-            }
-            teardown_session(sync, session_id).await
+            let intent = CleanupIntent::StartupFailure(failure.clone());
+            mark_cleanup_intent(sync, session_id, &intent).await?;
+            finish_cleanup(sync, session_id, intent).await
         }
         Action::ReplaceSucceededPod { session_id } => {
             delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await
@@ -534,12 +515,19 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         )
     })?;
 
+    let secret_name = session_token_secret_name(session_id);
+    let existing = sync.secrets.get_opt(&secret_name).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|s| s.annotations().contains_key(ANNOTATION_CLEANUP_INTENT))
+    {
+        clear_cleanup_intent(&sync.secrets, &secret_name).await?;
+    }
     let mut prepared = sync.provider.prepare(&claimed).await?;
     // See `recycle_unrestored_pod`: a crashed restore's replacement starts
     // without the provider's restore annotations so it deliberately
     // cold-starts instead of looping.
-    let secret_name = session_token_secret_name(session_id);
-    if let Some(existing) = sync.secrets.get_opt(&secret_name).await?
+    if let Some(existing) = existing
         && existing.annotations().get(ANNOTATION_RESTORE_RETRIED)
             == Some(&RETRY_WITHOUT_PIN.to_string())
     {
@@ -691,6 +679,120 @@ async fn delete_session_artifacts(
 ) -> crate::Result<()> {
     provider.on_terminate(session_id).await?;
     delete_ignoring_missing(secrets, secret_name).await
+}
+
+/// The secret is the retry handle: it goes only once the state is kept.
+async fn retire_vanished_session(
+    provider: &dyn SnapshotProvider,
+    secrets: &Api<Secret>,
+    session_id: &str,
+    secret_name: &str,
+) -> crate::Result<()> {
+    provider.on_vanish(session_id).await?;
+    delete_ignoring_missing(secrets, secret_name).await
+}
+
+const ANNOTATION_CLEANUP_INTENT: &str = "outposts.cognition.com/cleanup-intent";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "failure", rename_all = "snake_case")]
+enum CleanupIntent {
+    Terminate,
+    StartupFailure(crate::api::StartupFailure),
+    Delete,
+}
+
+async fn mark_cleanup_intent(
+    sync: &PoolSync<'_>,
+    session_id: &str,
+    intent: &CleanupIntent,
+) -> crate::Result<()> {
+    let secret = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": session_token_secret_name(session_id),
+            "namespace": sync.pool.namespace().unwrap_or_else(|| "default".to_string()),
+            "labels": {
+                LABEL_POOL: sync.pool.name_any(),
+                super::LABEL_SESSION_ID: session_id,
+            },
+            "ownerReferences": [pool_owner_ref(sync.pool)?],
+            "annotations": {
+                ANNOTATION_CLEANUP_INTENT: serde_json::to_string(intent)?,
+            },
+        },
+    });
+    sync.secrets
+        .patch(
+            &session_token_secret_name(session_id),
+            &PatchParams::apply("devin-outposts-k8s-cleanup"),
+            &Patch::Apply(&secret),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn clear_cleanup_intent(secrets: &Api<Secret>, secret_name: &str) -> crate::Result<()> {
+    let patch = serde_json::json!({
+        "metadata": {"annotations": {ANNOTATION_CLEANUP_INTENT: null}}
+    });
+    match secrets
+        .patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn finish_cleanup(
+    sync: &mut PoolSync<'_>,
+    session_id: &str,
+    intent: CleanupIntent,
+) -> crate::Result<()> {
+    let release = matches!(&intent, CleanupIntent::Terminate);
+    if let CleanupIntent::StartupFailure(failure) = &intent {
+        match sync
+            .outposts
+            .report_startup_failure(session_id, failure)
+            .await
+        {
+            Ok(()) => {
+                mark_cleanup_intent(sync, session_id, &CleanupIntent::Delete).await?;
+            }
+            // Not ours any more (claim expired and moved on): the pod is an
+            // orphan either way.
+            Err(Error::ClaimConflict { .. }) => {
+                clear_cleanup_intent(&sync.secrets, &session_token_secret_name(session_id)).await?;
+                return teardown_session(sync, session_id).await;
+            }
+            Err(e) if e.is_not_found() => {
+                return Err(anyhow::anyhow!(
+                    "session {session_id}: upstream has no startup-failure operation \
+                     (404); keeping the claim until it can take the report"
+                )
+                .into());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await?;
+    sync.pods_by_session.remove(session_id);
+    if release {
+        sync.provider.on_terminate(session_id).await?;
+        release_ignoring_conflict(sync.outposts, session_id).await?;
+        delete_ignoring_missing(&sync.secrets, &session_token_secret_name(session_id)).await
+    } else {
+        delete_session_artifacts(
+            sync.provider,
+            &sync.secrets,
+            session_id,
+            &session_token_secret_name(session_id),
+        )
+        .await
+    }
 }
 
 /// Delete the session's worker pod and token secret.
@@ -953,8 +1055,131 @@ mod tests {
     }
     #[tokio::test]
     async fn startup_failure_cleanup_keeps_the_secret_as_the_retry_handle() {
+        use std::sync::atomic::Ordering;
+
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+        let action = Action::StartupFailed {
+            session_id: "s".to_string(),
+            failure: crate::api::StartupFailure {
+                reason: crate::api::StartupFailureReason::ImagePullError,
+                image: Some("img:x".to_string()),
+                message: "pull failed".to_string(),
+            },
+        };
+        let (outposts, provider) = sync_deps(&pool, &client);
+        let mut sync = PoolSync {
+            pool: &pool,
+            ctx: &ctx,
+            outposts: &outposts,
+            provider: &provider,
+            pods: Api::namespaced(client.clone(), "default"),
+            secrets: Api::namespaced(client.clone(), "default"),
+            pods_by_session: BTreeMap::new(),
+            snapshot_pending: false,
+        };
+
+        // Report refused upstream: nothing is torn down.
+        server.report_status.store(500, Ordering::SeqCst);
+        assert!(execute(&mut sync, &action).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(*server.pod.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        // Report conflict (claimed elsewhere): pod and secret go, artifacts
+        // stay — the PVC may belong to a new owner now.
+        server.report_status.store(409, Ordering::SeqCst);
+        execute(&mut sync, &action).await.unwrap();
+        assert!(!*server.pod.lock().unwrap());
+        assert!(!*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert!(
+            !server
+                .secret_annotations
+                .lock()
+                .unwrap()
+                .contains_key(ANNOTATION_CLEANUP_INTENT)
+        );
+
+        // Report accepted but PVC cleanup fails: pod is gone, the secret is
+        // kept, and the error propagates.
+        *server.pod.lock().unwrap() = true;
+        *server.secret.lock().unwrap() = true;
+        server.report_status.store(200, Ordering::SeqCst);
+        server.fail_pvc_delete.store(true, Ordering::SeqCst);
+        assert!(execute(&mut sync, &action).await.is_err());
+        assert!(!*server.pod.lock().unwrap());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert_eq!(intent_kind(&server), "delete");
+
+        // The retained secret drives a retry later: still failing PVC means
+        // still no secret deletion.
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        // Once cleanup succeeds the secret goes too.
+        server.fail_pvc_delete.store(false, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[derive(Clone)]
+    struct RetentionServer {
+        pvc: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        secret: Arc<std::sync::Mutex<bool>>,
+        secret_annotations: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+        pod: Arc<std::sync::Mutex<bool>>,
+        sessions: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        fail_pvc_patch: Arc<std::sync::atomic::AtomicBool>,
+        fail_pvc_delete: Arc<std::sync::atomic::AtomicBool>,
+        fail_pod_delete: Arc<std::sync::atomic::AtomicBool>,
+        fail_secret_patch: Arc<std::sync::atomic::AtomicBool>,
+        report_status: Arc<std::sync::atomic::AtomicU16>,
+        release_status: Arc<std::sync::atomic::AtomicU16>,
+        report_count: Arc<std::sync::atomic::AtomicUsize>,
+        release_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn retained_pvc() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": crate::controller::state_pvc_name("s"),
+                "namespace": "default",
+                "uid": "original-pvc",
+                "labels": {
+                    LABEL_POOL: "p",
+                    super::super::LABEL_SESSION_ID: "s",
+                },
+                "annotations": {},
+            },
+            "spec": {
+                "volumeName": "original-pv",
+                "dataSource": {
+                    "apiGroup": "",
+                    "kind": "PersistentVolumeClaim",
+                    "name": "golden-home",
+                },
+            },
+        })
+    }
+
+    async fn retention_fixture(
+        snapshot_ttl_seconds: Option<u64>,
+    ) -> (
+        RetentionServer,
+        kube::Client,
+        Arc<OutpostPool>,
+        Context,
+        tokio::task::JoinHandle<()>,
+    ) {
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
         use axum::extract::{Request, State};
         use axum::http::StatusCode;
@@ -962,57 +1187,323 @@ mod tests {
         use axum::routing::any;
         use axum::{Router, serve};
 
-        #[derive(Clone, Default)]
-        struct Server {
-            report: Arc<AtomicU16>,
-            pvc: Arc<AtomicU16>,
-            calls: Arc<Mutex<Vec<(String, String)>>>,
+        fn status(code: u16, reason: &str) -> Response {
+            (
+                StatusCode::from_u16(code).unwrap(),
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": reason,
+                    "code": code,
+                })),
+            )
+                .into_response()
         }
 
-        async fn handle(State(server): State<Server>, req: Request) -> Response {
-            let (method, path) = (req.method().to_string(), req.uri().path().to_string());
-            server
-                .calls
-                .lock()
-                .unwrap()
-                .push((method.clone(), path.clone()));
-            let success = Json(serde_json::json!({
+        fn success() -> Response {
+            Json(serde_json::json!({
                 "apiVersion": "v1", "kind": "Status", "status": "Success"
             }))
-            .into_response();
-            if method == "POST" && path.ends_with("/startup-failure") {
-                return StatusCode::from_u16(server.report.load(Ordering::SeqCst))
-                    .unwrap()
-                    .into_response();
-            }
-            if method == "DELETE" {
-                if path.contains("/pods/") || path.contains("/secrets/") {
-                    return success;
-                }
-                if path.contains("/persistentvolumeclaims/") {
-                    return match server.pvc.load(Ordering::SeqCst) {
-                        200 => success,
-                        code => StatusCode::from_u16(code).unwrap().into_response(),
-                    };
-                }
-            }
-            StatusCode::NOT_FOUND.into_response()
+            .into_response()
         }
 
-        let server = Server::default();
-        let app = Router::new()
-            .route("/{*path}", any(handle))
-            .with_state(server.clone());
+        fn session_secret_json(server: &RetentionServer) -> serde_json::Value {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": session_token_secret_name("s"),
+                    "namespace": "default",
+                    "labels": {
+                        LABEL_POOL: "p",
+                        super::super::LABEL_SESSION_ID: "s",
+                    },
+                    "annotations": server.secret_annotations.lock().unwrap().clone(),
+                },
+            })
+        }
+
+        async fn handle(
+            State((server, pool_json)): State<(RetentionServer, serde_json::Value)>,
+            req: Request,
+        ) -> Response {
+            let method = req.method().clone();
+            let path = req.uri().path().to_string();
+            let watch = req.uri().query().unwrap_or("").contains("watch=true");
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let ns = "/api/v1/namespaces/default";
+
+            if path == "/opbeta/outposts/devins" {
+                if watch {
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "",
+                    )
+                        .into_response();
+                }
+                let items = server.sessions.lock().unwrap().clone();
+                return Json(serde_json::json!({
+                    "items": items, "cursor": null, "has_next_page": false, "total": 0
+                }))
+                .into_response();
+            }
+            if let Some(rest) = path.strip_prefix("/opbeta/outposts/devins/") {
+                match (method.as_str(), rest) {
+                    ("POST", "s/claim") => {
+                        return Json(serde_json::json!({
+                            "metadata": {"session_id": "s", "outpost_id": "pool_x"},
+                            "spec": {"kind": "resume", "platform": "linux"},
+                            "status": {
+                                "phase": "claimed",
+                                "acceptor_id": "us",
+                                "session_status": "running",
+                                "connect_token": "ct",
+                                "gateway_url": "ws://gw",
+                            },
+                        }))
+                        .into_response();
+                    }
+                    ("POST", "s/release") => {
+                        server.release_count.fetch_add(1, Ordering::SeqCst);
+                        let code = server.release_status.load(Ordering::SeqCst);
+                        return match code {
+                            200 => success(),
+                            _ => status(code, "Failure"),
+                        };
+                    }
+                    ("POST", "s/startup-failure") => {
+                        server.report_count.fetch_add(1, Ordering::SeqCst);
+                        let code = server.report_status.load(Ordering::SeqCst);
+                        return match code {
+                            200 => success(),
+                            _ => status(code, "Failure"),
+                        };
+                    }
+                    _ => return status(404, "NotFound"),
+                }
+            }
+
+            if path == format!("{ns}/pods") && method.as_str() == "GET" {
+                let items = if *server.pod.lock().unwrap() {
+                    vec![serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": worker_pod_name("s"),
+                            "namespace": "default",
+                            "labels": {
+                                LABEL_POOL: "p",
+                                super::super::LABEL_SESSION_ID: "s",
+                            },
+                            "ownerReferences": [{
+                                "apiVersion": "outposts.cognition.com/v1alpha1",
+                                "kind": "OutpostPool",
+                                "name": "p",
+                                "uid": "pool-uid",
+                            }],
+                        },
+                        "status": {"phase": "Running"},
+                    })]
+                } else {
+                    vec![]
+                };
+                return Json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "PodList", "items": items
+                }))
+                .into_response();
+            }
+            if path == format!("{ns}/pods") && method.as_str() == "POST" {
+                let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                *server.pod.lock().unwrap() = true;
+                return Json(pod).into_response();
+            }
+            if path.starts_with(&format!("{ns}/pods/")) {
+                if method.as_str() == "DELETE" {
+                    if server.fail_pod_delete.load(Ordering::SeqCst) {
+                        return status(500, "InternalError");
+                    }
+                    let mut pod = server.pod.lock().unwrap();
+                    if !*pod {
+                        return status(404, "NotFound");
+                    }
+                    *pod = false;
+                    return success();
+                }
+                return status(500, "InternalError");
+            }
+
+            if path == format!("{ns}/secrets") && method.as_str() == "GET" {
+                let items = if *server.secret.lock().unwrap() {
+                    vec![session_secret_json(&server)]
+                } else {
+                    vec![]
+                };
+                return Json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "SecretList", "items": items
+                }))
+                .into_response();
+            }
+            if let Some(name) = path.strip_prefix(&format!("{ns}/secrets/")) {
+                let session_secret = name == session_token_secret_name("s");
+                match method.as_str() {
+                    "GET" if name == "t" => {
+                        return Json(serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": {"name": "t", "namespace": "default"},
+                            "data": {"token": "dG9r"},
+                        }))
+                        .into_response();
+                    }
+                    "GET" if session_secret && *server.secret.lock().unwrap() => {
+                        return Json(session_secret_json(&server)).into_response();
+                    }
+                    "PATCH" if session_secret => {
+                        if server.fail_secret_patch.load(Ordering::SeqCst) {
+                            return status(500, "InternalError");
+                        }
+                        let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if !*server.secret.lock().unwrap()
+                            && patch.pointer("/metadata/name").is_none()
+                        {
+                            return status(404, "NotFound");
+                        }
+                        if let Some(annotations) = patch
+                            .pointer("/metadata/annotations")
+                            .and_then(|a| a.as_object())
+                        {
+                            let mut stored = server.secret_annotations.lock().unwrap();
+                            for (key, value) in annotations {
+                                if value.is_null() {
+                                    stored.remove(key);
+                                } else {
+                                    stored.insert(
+                                        key.clone(),
+                                        value
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| value.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                        *server.secret.lock().unwrap() = true;
+                        return Json(session_secret_json(&server)).into_response();
+                    }
+                    "DELETE" if session_secret => {
+                        let mut secret = server.secret.lock().unwrap();
+                        if !*secret {
+                            return status(404, "NotFound");
+                        }
+                        *secret = false;
+                        server.secret_annotations.lock().unwrap().clear();
+                        return success();
+                    }
+                    _ => return status(404, "NotFound"),
+                }
+            }
+
+            if path == format!("{ns}/persistentvolumeclaims") && method.as_str() == "GET" {
+                let items = server
+                    .pvc
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                return Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaimList",
+                    "items": items,
+                }))
+                .into_response();
+            }
+            if path.starts_with(&format!("{ns}/persistentvolumeclaims/")) {
+                match method.as_str() {
+                    "GET" => {
+                        return match server.pvc.lock().unwrap().clone() {
+                            Some(pvc) => Json(pvc).into_response(),
+                            None => status(404, "NotFound"),
+                        };
+                    }
+                    "PATCH" => {
+                        if server.fail_pvc_patch.load(Ordering::SeqCst) {
+                            return status(500, "InternalError");
+                        }
+                        let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let mut stored = server.pvc.lock().unwrap();
+                        let Some(pvc) = stored.as_mut() else {
+                            return status(404, "NotFound");
+                        };
+                        if let Some(annotations) = patch
+                            .pointer("/metadata/annotations")
+                            .and_then(|a| a.as_object())
+                        {
+                            let target = pvc
+                                .pointer_mut("/metadata/annotations")
+                                .and_then(|a| a.as_object_mut())
+                                .expect("fixture PVC keeps an annotations map");
+                            for (key, value) in annotations {
+                                if value.is_null() {
+                                    target.remove(key);
+                                } else {
+                                    target.insert(key.clone(), value.clone());
+                                }
+                            }
+                        }
+                        return Json(pvc.clone()).into_response();
+                    }
+                    "DELETE" => {
+                        if server.fail_pvc_delete.load(Ordering::SeqCst) {
+                            return status(500, "InternalError");
+                        }
+                        let mut stored = server.pvc.lock().unwrap();
+                        if stored.is_none() {
+                            return status(404, "NotFound");
+                        }
+                        *stored = None;
+                        return success();
+                    }
+                    _ => return status(500, "InternalError"),
+                }
+            }
+
+            if path.ends_with("/status")
+                && path.contains("/outpostpools/")
+                && method.as_str() == "PATCH"
+            {
+                let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let mut pool = pool_json.clone();
+                pool["status"] = patch["status"].clone();
+                return Json(pool).into_response();
+            }
+
+            status(500, "InternalError")
+        }
+
+        let server = RetentionServer {
+            pvc: Arc::new(Mutex::new(Some(retained_pvc()))),
+            secret: Arc::new(Mutex::new(true)),
+            secret_annotations: Arc::new(Mutex::new(BTreeMap::new())),
+            pod: Arc::new(Mutex::new(true)),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            fail_pvc_patch: Arc::new(AtomicBool::new(false)),
+            fail_pvc_delete: Arc::new(AtomicBool::new(false)),
+            fail_pod_delete: Arc::new(AtomicBool::new(false)),
+            fail_secret_patch: Arc::new(AtomicBool::new(false)),
+            report_status: Arc::new(AtomicU16::new(200)),
+            release_status: Arc::new(AtomicU16::new(200)),
+            report_count: Arc::new(AtomicUsize::new(0)),
+            release_count: Arc::new(AtomicUsize::new(0)),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let http = tokio::spawn(async move { serve(listener, app).await.unwrap() });
-        let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let client = kube::Client::try_from(kube::Config::new(
-            format!("http://{address}").parse().unwrap(),
-        ))
-        .unwrap();
-        let pool = Arc::new(OutpostPool::new(
+        let mut pool = OutpostPool::new(
             "p",
             crate::crd::OutpostPoolSpec {
                 pool_id: "pool_x".to_string(),
@@ -1027,119 +1518,384 @@ mod tests {
                     container_name: "devin-worker".to_string(),
                     overrides: Default::default(),
                 },
-                resume: Default::default(),
+                resume: crate::crd::ResumeConfig {
+                    policy: crate::crd::ResumePolicy::FilesystemSnapshot,
+                    snapshot_ttl_seconds,
+                    ..Default::default()
+                },
                 image_build: None,
             },
-        ));
+        );
+        pool.metadata.namespace = Some("default".to_string());
+        pool.metadata.uid = Some("pool-uid".to_string());
+        let pool = Arc::new(pool);
+        let pool_json = serde_json::to_value(&*pool).unwrap();
+
+        let app = Router::new()
+            .route("/{*path}", any(handle))
+            .with_state((server.clone(), pool_json));
+        let http = tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let client = kube::Client::try_from(kube::Config::new(
+            format!("http://{address}").parse().unwrap(),
+        ))
+        .unwrap();
         let (trigger_tx, _trigger_rx) = futures::channel::mpsc::unbounded::<()>();
+        let config = OperatorConfig {
+            acceptor_id: Some("us".to_string()),
+            ..Default::default()
+        };
         let ctx = Context::new(
             client.clone(),
-            Arc::new(OperatorConfig::default()),
+            Arc::new(config),
             Arc::new(Metrics::default()),
             Arc::new(PoolWatchers::new(trigger_tx)),
         );
-        let outposts = OutpostsClient::new(format!("http://{address}"), "tok", "us").unwrap();
-        let provider =
-            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
-        let secrets: Api<Secret> = Api::namespaced(client.clone(), "ns");
-        let session_id = "s";
+        (server, client, pool, ctx, http)
+    }
+
+    fn retention_teardown(pool: &OutpostPool, ctx: &Context, http: tokio::task::JoinHandle<()>) {
+        ctx.watchers.remove(&pool.uid().unwrap_or_default());
+        http.abort();
+    }
+
+    fn sync_deps(
+        pool: &Arc<OutpostPool>,
+        client: &kube::Client,
+    ) -> (OutpostsClient, crate::snapshot::FilesystemSnapshotProvider) {
+        (
+            OutpostsClient::new(pool.spec.api_url.clone().unwrap(), "tok", "us").unwrap(),
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone()),
+        )
+    }
+
+    fn restart_context(client: &kube::Client, ctx: &Context) -> Context {
+        let (trigger_tx, _trigger_rx) = futures::channel::mpsc::unbounded::<()>();
+        Context::new(
+            client.clone(),
+            ctx.config.clone(),
+            ctx.metrics.clone(),
+            Arc::new(PoolWatchers::new(trigger_tx)),
+        )
+    }
+
+    fn intent_kind(server: &RetentionServer) -> serde_json::Value {
+        let raw = server.secret_annotations.lock().unwrap()[ANNOTATION_CLEANUP_INTENT].clone();
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap()["kind"].clone()
+    }
+
+    #[tokio::test]
+    async fn terminated_session_cleanup_retries_after_queue_disappears() {
+        use std::sync::atomic::Ordering;
+
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+        let (outposts, provider) = sync_deps(&pool, &client);
+        let mut sync = PoolSync {
+            pool: &pool,
+            ctx: &ctx,
+            outposts: &outposts,
+            provider: &provider,
+            pods: Api::namespaced(client.clone(), "default"),
+            secrets: Api::namespaced(client.clone(), "default"),
+            pods_by_session: BTreeMap::new(),
+            snapshot_pending: false,
+        };
+        let action = Action::Terminate {
+            session_id: "s".to_string(),
+        };
+
+        server.fail_pvc_delete.store(true, Ordering::SeqCst);
+        assert!(execute(&mut sync, &action).await.is_err());
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 0);
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert_eq!(intent_kind(&server), "terminate");
+
+        let ctx = restart_context(&client, &ctx);
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 0);
+
+        server.fail_pvc_delete.store(false, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+        assert!(!*server.secret.lock().unwrap());
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 1);
+
+        *server.pvc.lock().unwrap() = Some(retained_pvc());
+        *server.secret.lock().unwrap() = true;
+        server.secret_annotations.lock().unwrap().insert(
+            ANNOTATION_CLEANUP_INTENT.to_string(),
+            "{\"kind\":\"terminate\"}".to_string(),
+        );
+        server.release_status.store(500, Ordering::SeqCst);
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_none());
+        server.release_status.store(200, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+
+        *server.pvc.lock().unwrap() = Some(retained_pvc());
+        *server.secret.lock().unwrap() = true;
+        server.secret_annotations.lock().unwrap().insert(
+            ANNOTATION_CLEANUP_INTENT.to_string(),
+            "{\"kind\":\"terminate\"}".to_string(),
+        );
+        server.release_status.store(404, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+        assert!(!*server.secret.lock().unwrap());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn cleanup_intent_is_durable_before_backend_acknowledgement() {
+        use std::sync::atomic::Ordering;
+
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
         let action = Action::StartupFailed {
-            session_id: session_id.to_string(),
+            session_id: "s".to_string(),
             failure: crate::api::StartupFailure {
                 reason: crate::api::StartupFailureReason::ImagePullError,
                 image: Some("img:x".to_string()),
                 message: "pull failed".to_string(),
             },
         };
+        let (outposts, provider) = sync_deps(&pool, &client);
         let mut sync = PoolSync {
             pool: &pool,
             ctx: &ctx,
             outposts: &outposts,
             provider: &provider,
-            pods: Api::namespaced(client.clone(), "ns"),
-            secrets: secrets.clone(),
+            pods: Api::namespaced(client.clone(), "default"),
+            secrets: Api::namespaced(client.clone(), "default"),
             pods_by_session: BTreeMap::new(),
             snapshot_pending: false,
         };
-        let calls = || server.calls.lock().unwrap().clone();
-        let pod_path = format!("/api/v1/namespaces/ns/pods/{}", worker_pod_name(session_id));
-        let pvc_path = format!(
-            "/api/v1/namespaces/default/persistentvolumeclaims/{}",
-            crate::controller::state_pvc_name(session_id)
-        );
-        let secret_path = format!(
-            "/api/v1/namespaces/ns/secrets/{}",
-            session_token_secret_name(session_id)
-        );
-        let report_path = format!("/opbeta/outposts/devins/{session_id}/startup-failure");
 
-        // Report refused upstream: nothing is torn down.
-        server.report.store(500, Ordering::SeqCst);
+        server.fail_secret_patch.store(true, Ordering::SeqCst);
         assert!(execute(&mut sync, &action).await.is_err());
-        assert_eq!(calls(), [("POST".to_string(), report_path.clone())]);
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 0);
+        assert!(*server.secret.lock().unwrap());
+        assert!(*server.pod.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        server.fail_secret_patch.store(false, Ordering::SeqCst);
 
-        // Report conflict (claimed elsewhere): pod and secret go, artifacts
-        // stay — the PVC may belong to a new owner now.
-        server.report.store(409, Ordering::SeqCst);
-        server.calls.lock().unwrap().clear();
-        execute(&mut sync, &action).await.unwrap();
-        assert_eq!(
-            calls(),
-            [
-                ("POST".to_string(), report_path.clone()),
-                ("DELETE".to_string(), pod_path.clone()),
-                ("DELETE".to_string(), secret_path.clone())
-            ]
-        );
-
-        // Report accepted but PVC cleanup fails: pod is gone, the secret is
-        // kept, and the error propagates.
-        server.report.store(200, Ordering::SeqCst);
-        server.pvc.store(500, Ordering::SeqCst);
-        server.calls.lock().unwrap().clear();
+        server.report_status.store(500, Ordering::SeqCst);
         assert!(execute(&mut sync, &action).await.is_err());
-        assert_eq!(
-            calls(),
-            [
-                ("POST".to_string(), report_path.clone()),
-                ("DELETE".to_string(), pod_path.clone()),
-                ("DELETE".to_string(), pvc_path.clone())
-            ]
-        );
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 1);
+        assert_eq!(intent_kind(&server), "startup_failure");
 
-        // The retained secret drives a retry later: still failing PVC means
-        // still no secret deletion.
-        server.calls.lock().unwrap().clear();
+        server.report_status.store(200, Ordering::SeqCst);
+        server.fail_secret_patch.store(true, Ordering::SeqCst);
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 2);
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert_eq!(intent_kind(&server), "startup_failure");
+
+        server.fail_secret_patch.store(false, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 3);
+        assert!(!*server.secret.lock().unwrap());
+        assert!(!*server.pod.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn live_or_reclaimed_session_outlives_stale_cleanup_intent() {
+        use std::sync::atomic::Ordering;
+
+        let (server, _client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+
+        *server.pod.lock().unwrap() = false;
+        server.secret_annotations.lock().unwrap().insert(
+            ANNOTATION_CLEANUP_INTENT.to_string(),
+            "{\"kind\":\"delete\"}".to_string(),
+        );
+        server.sessions.lock().unwrap().push(serde_json::json!({
+            "metadata": {"session_id": "s", "outpost_id": "pool_x"},
+            "spec": {"kind": "resume", "platform": "linux"},
+            "status": {"phase": "pending", "session_status": "pending"},
+        }));
+
+        apply(pool.clone(), &ctx).await.unwrap();
+
+        assert!(*server.pod.lock().unwrap());
+        assert!(*server.secret.lock().unwrap());
         assert!(
-            delete_session_artifacts(
-                &provider,
-                &secrets,
-                session_id,
-                &session_token_secret_name(session_id),
-            )
-            .await
-            .is_err()
+            !server
+                .secret_annotations
+                .lock()
+                .unwrap()
+                .contains_key(ANNOTATION_CLEANUP_INTENT)
         );
-        assert_eq!(calls(), [("DELETE".to_string(), pvc_path.clone())]);
+        let pvc = server.pvc.lock().unwrap().clone().unwrap();
+        assert_eq!(pvc["metadata"]["uid"], "original-pvc");
+        assert_eq!(pvc["spec"]["volumeName"], "original-pv");
 
-        // Once cleanup succeeds the secret goes too.
-        server.pvc.store(200, Ordering::SeqCst);
-        server.calls.lock().unwrap().clear();
-        delete_session_artifacts(
-            &provider,
-            &secrets,
-            session_id,
-            &session_token_secret_name(session_id),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            calls(),
-            [
-                ("DELETE".to_string(), pvc_path.clone()),
-                ("DELETE".to_string(), secret_path.clone())
-            ]
+        *server.sessions.lock().unwrap() = vec![serde_json::json!({
+            "metadata": {"session_id": "s", "outpost_id": "pool_x"},
+            "spec": {"kind": "resume", "platform": "linux"},
+            "status": {
+                "phase": "claimed",
+                "acceptor_id": "us",
+                "claim_deadline": chrono::Utc::now().timestamp() + 86_400,
+                "session_status": "running",
+            },
+        })];
+        server.secret_annotations.lock().unwrap().insert(
+            ANNOTATION_CLEANUP_INTENT.to_string(),
+            "{\"kind\":\"delete\"}".to_string(),
         );
-        http.abort();
+
+        apply(pool.clone(), &ctx).await.unwrap();
+
+        assert!(*server.secret.lock().unwrap());
+        assert!(
+            server
+                .secret_annotations
+                .lock()
+                .unwrap()
+                .contains_key(ANNOTATION_CLEANUP_INTENT)
+        );
+        assert!(server.pvc.lock().unwrap().is_some());
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 0);
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn vanished_session_reconcile_preserves_pvc_for_resume() {
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+
+        apply(pool.clone(), &ctx).await.unwrap();
+
+        assert!(!*server.pod.lock().unwrap());
+        assert!(!*server.secret.lock().unwrap());
+        let retained = server.pvc.lock().unwrap().clone().unwrap();
+        assert_eq!(retained["metadata"]["uid"], "original-pvc");
+        assert_eq!(retained["spec"]["volumeName"], "original-pv");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(
+                retained["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT]
+                    .as_str()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+
+        let resume_session: crate::api::OutpostDevin = serde_json::from_value(serde_json::json!({
+            "metadata": {"session_id": "s", "outpost_id": "pool_x"},
+            "spec": {"kind": "resume", "platform": "linux"},
+            "status": {"phase": "pending", "session_status": "pending"},
+        }))
+        .unwrap();
+        let provider =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
+        provider.prepare(&resume_session).await.unwrap();
+
+        let resumed = server.pvc.lock().unwrap().clone().unwrap();
+        assert_eq!(resumed["metadata"]["uid"], "original-pvc");
+        assert_eq!(resumed["spec"]["volumeName"], "original-pv");
+        assert!(
+            resumed["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT].is_null()
+        );
+
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn vanished_session_retention_retries_and_keeps_existing_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let (server, _client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+
+        server.fail_pvc_patch.store(true, Ordering::SeqCst);
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        server.fail_pvc_patch.store(false, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(
+                server.pvc.lock().unwrap().clone().unwrap()["metadata"]["annotations"]
+                    [super::super::ANNOTATION_SUSPENDED_AT]
+                    .as_str()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+
+        let deadline = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(deadline.clone());
+        }
+        *server.secret.lock().unwrap() = true;
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+        assert_eq!(
+            server.pvc.lock().unwrap().clone().unwrap()["metadata"]["annotations"]
+                [super::super::ANNOTATION_SUSPENDED_AT],
+            serde_json::Value::String(deadline)
+        );
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn vanished_session_retention_expires_only_after_ttl() {
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+        let provider =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
+
+        apply(pool.clone(), &ctx).await.unwrap();
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(
+                    (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+                );
+        }
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        *server.pvc.lock().unwrap() = Some(retained_pvc());
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(
+                    (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+                );
+        }
+        let mut unlimited = (*pool).clone();
+        unlimited.spec.resume.snapshot_ttl_seconds = None;
+        let unlimited =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), Arc::new(unlimited));
+        unlimited.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+        unlimited.on_terminate("s").await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        retention_teardown(&pool, &ctx, http);
     }
 }
