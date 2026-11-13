@@ -48,7 +48,7 @@ impl StartupFailureReason {
 
 /// What a worker pod that could not start reported: the reason, the image it
 /// was waiting on (if the failure concerns one) and the kubelet's message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupFailure {
     pub reason: StartupFailureReason,
     pub image: Option<String>,
