@@ -320,7 +320,8 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
     }
     let snapshot_pending = sync.snapshot_pending;
 
-    // Cleanup: token secrets whose session no longer exists in the queue.
+    // Cleanup: token secrets whose session left the queue; its state stays
+    // for a resume (`on_vanish`).
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
     let selector = format!("{LABEL_POOL}={}", pool.name_any());
     let expected_secrets: Vec<String> = sessions
@@ -335,7 +336,7 @@ async fn apply(pool: Arc<OutpostPool>, ctx: &Context) -> crate::Result<RequeueAc
         if !expected_secrets.contains(&name) {
             let result = match secret.labels().get(super::LABEL_SESSION_ID) {
                 Some(session_id) => {
-                    delete_session_artifacts(provider.as_ref(), &secrets, session_id, &name).await
+                    retire_vanished_session(provider.as_ref(), &secrets, session_id, &name).await
                 }
                 None => delete_ignoring_missing(&secrets, &name).await,
             };
@@ -690,6 +691,17 @@ async fn delete_session_artifacts(
     secret_name: &str,
 ) -> crate::Result<()> {
     provider.on_terminate(session_id).await?;
+    delete_ignoring_missing(secrets, secret_name).await
+}
+
+/// The secret is the retry handle: it goes only once the state is kept.
+async fn retire_vanished_session(
+    provider: &dyn SnapshotProvider,
+    secrets: &Api<Secret>,
+    session_id: &str,
+    secret_name: &str,
+) -> crate::Result<()> {
+    provider.on_vanish(session_id).await?;
     delete_ignoring_missing(secrets, secret_name).await
 }
 
@@ -1141,5 +1153,475 @@ mod tests {
             ]
         );
         http.abort();
+    }
+
+    #[derive(Clone)]
+    struct RetentionServer {
+        pvc: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        secret: Arc<std::sync::Mutex<bool>>,
+        pod: Arc<std::sync::Mutex<bool>>,
+        fail_pvc_patch: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn retained_pvc() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": crate::controller::state_pvc_name("s"),
+                "namespace": "default",
+                "uid": "original-pvc",
+                "labels": {
+                    LABEL_POOL: "p",
+                    super::super::LABEL_SESSION_ID: "s",
+                },
+                "annotations": {},
+            },
+            "spec": {
+                "volumeName": "original-pv",
+                "dataSource": {
+                    "apiGroup": "",
+                    "kind": "PersistentVolumeClaim",
+                    "name": "golden-home",
+                },
+            },
+        })
+    }
+
+    async fn retention_fixture(
+        snapshot_ttl_seconds: Option<u64>,
+    ) -> (
+        RetentionServer,
+        kube::Client,
+        Arc<OutpostPool>,
+        Context,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use axum::extract::{Request, State};
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Json, Response};
+        use axum::routing::any;
+        use axum::{Router, serve};
+
+        fn status(code: u16, reason: &str) -> Response {
+            (
+                StatusCode::from_u16(code).unwrap(),
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": reason,
+                    "code": code,
+                })),
+            )
+                .into_response()
+        }
+
+        fn success() -> Response {
+            Json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Success"
+            }))
+            .into_response()
+        }
+
+        async fn handle(
+            State((server, pool_json)): State<(RetentionServer, serde_json::Value)>,
+            req: Request,
+        ) -> Response {
+            let method = req.method().clone();
+            let path = req.uri().path().to_string();
+            let watch = req.uri().query().unwrap_or("").contains("watch=true");
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let ns = "/api/v1/namespaces/default";
+
+            if path == "/opbeta/outposts/devins" {
+                if watch {
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "",
+                    )
+                        .into_response();
+                }
+                return Json(serde_json::json!({
+                    "items": [], "cursor": null, "has_next_page": false, "total": 0
+                }))
+                .into_response();
+            }
+
+            if path == format!("{ns}/pods") && method.as_str() == "GET" {
+                let items = if *server.pod.lock().unwrap() {
+                    vec![serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": worker_pod_name("s"),
+                            "namespace": "default",
+                            "labels": {
+                                LABEL_POOL: "p",
+                                super::super::LABEL_SESSION_ID: "s",
+                            },
+                            "ownerReferences": [{
+                                "apiVersion": "outposts.cognition.com/v1alpha1",
+                                "kind": "OutpostPool",
+                                "name": "p",
+                                "uid": "pool-uid",
+                            }],
+                        },
+                        "status": {"phase": "Running"},
+                    })]
+                } else {
+                    vec![]
+                };
+                return Json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "PodList", "items": items
+                }))
+                .into_response();
+            }
+            if path.starts_with(&format!("{ns}/pods/")) {
+                if method.as_str() == "DELETE" {
+                    let mut pod = server.pod.lock().unwrap();
+                    if !*pod {
+                        return status(404, "NotFound");
+                    }
+                    *pod = false;
+                    return success();
+                }
+                return status(500, "InternalError");
+            }
+
+            if path == format!("{ns}/secrets") && method.as_str() == "GET" {
+                let items = if *server.secret.lock().unwrap() {
+                    vec![serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {
+                            "name": session_token_secret_name("s"),
+                            "namespace": "default",
+                            "labels": {
+                                LABEL_POOL: "p",
+                                super::super::LABEL_SESSION_ID: "s",
+                            },
+                        },
+                    })]
+                } else {
+                    vec![]
+                };
+                return Json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "SecretList", "items": items
+                }))
+                .into_response();
+            }
+            if let Some(name) = path.strip_prefix(&format!("{ns}/secrets/")) {
+                let session_secret = name == session_token_secret_name("s");
+                match method.as_str() {
+                    "GET" if name == "t" => {
+                        return Json(serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": {"name": "t", "namespace": "default"},
+                            "data": {"token": "dG9r"},
+                        }))
+                        .into_response();
+                    }
+                    "GET" if session_secret && *server.secret.lock().unwrap() => {
+                        return Json(serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": {
+                                "name": session_token_secret_name("s"),
+                                "namespace": "default",
+                                "labels": {
+                                    LABEL_POOL: "p",
+                                    super::super::LABEL_SESSION_ID: "s",
+                                },
+                            },
+                        }))
+                        .into_response();
+                    }
+                    "DELETE" if session_secret => {
+                        let mut secret = server.secret.lock().unwrap();
+                        if !*secret {
+                            return status(404, "NotFound");
+                        }
+                        *secret = false;
+                        return success();
+                    }
+                    _ => return status(404, "NotFound"),
+                }
+            }
+
+            if path == format!("{ns}/persistentvolumeclaims") && method.as_str() == "GET" {
+                let items = server
+                    .pvc
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                return Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaimList",
+                    "items": items,
+                }))
+                .into_response();
+            }
+            if path.starts_with(&format!("{ns}/persistentvolumeclaims/")) {
+                match method.as_str() {
+                    "GET" => {
+                        return match server.pvc.lock().unwrap().clone() {
+                            Some(pvc) => Json(pvc).into_response(),
+                            None => status(404, "NotFound"),
+                        };
+                    }
+                    "PATCH" => {
+                        if server.fail_pvc_patch.load(Ordering::SeqCst) {
+                            return status(500, "InternalError");
+                        }
+                        let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let mut stored = server.pvc.lock().unwrap();
+                        let Some(pvc) = stored.as_mut() else {
+                            return status(404, "NotFound");
+                        };
+                        if let Some(annotations) = patch
+                            .pointer("/metadata/annotations")
+                            .and_then(|a| a.as_object())
+                        {
+                            let target = pvc
+                                .pointer_mut("/metadata/annotations")
+                                .and_then(|a| a.as_object_mut())
+                                .expect("fixture PVC keeps an annotations map");
+                            for (key, value) in annotations {
+                                if value.is_null() {
+                                    target.remove(key);
+                                } else {
+                                    target.insert(key.clone(), value.clone());
+                                }
+                            }
+                        }
+                        return Json(pvc.clone()).into_response();
+                    }
+                    "DELETE" => {
+                        let mut stored = server.pvc.lock().unwrap();
+                        if stored.is_none() {
+                            return status(404, "NotFound");
+                        }
+                        *stored = None;
+                        return success();
+                    }
+                    _ => return status(500, "InternalError"),
+                }
+            }
+
+            if path.ends_with("/status")
+                && path.contains("/outpostpools/")
+                && method.as_str() == "PATCH"
+            {
+                let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let mut pool = pool_json.clone();
+                pool["status"] = patch["status"].clone();
+                return Json(pool).into_response();
+            }
+
+            status(500, "InternalError")
+        }
+
+        let server = RetentionServer {
+            pvc: Arc::new(Mutex::new(Some(retained_pvc()))),
+            secret: Arc::new(Mutex::new(true)),
+            pod: Arc::new(Mutex::new(true)),
+            fail_pvc_patch: Arc::new(AtomicBool::new(false)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let mut pool = OutpostPool::new(
+            "p",
+            crate::crd::OutpostPoolSpec {
+                pool_id: "pool_x".to_string(),
+                token_secret_ref: crate::crd::SecretKeyRef {
+                    name: "t".to_string(),
+                    key: "token".to_string(),
+                },
+                api_url: Some(format!("http://{address}")),
+                max_concurrent_sessions: 1,
+                worker: crate::crd::WorkerTemplate {
+                    template: Default::default(),
+                    container_name: "devin-worker".to_string(),
+                    overrides: Default::default(),
+                },
+                resume: crate::crd::ResumeConfig {
+                    policy: crate::crd::ResumePolicy::FilesystemSnapshot,
+                    snapshot_ttl_seconds,
+                    ..Default::default()
+                },
+                image_build: None,
+            },
+        );
+        pool.metadata.namespace = Some("default".to_string());
+        pool.metadata.uid = Some("pool-uid".to_string());
+        let pool = Arc::new(pool);
+        let pool_json = serde_json::to_value(&*pool).unwrap();
+
+        let app = Router::new()
+            .route("/{*path}", any(handle))
+            .with_state((server.clone(), pool_json));
+        let http = tokio::spawn(async move { serve(listener, app).await.unwrap() });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let client = kube::Client::try_from(kube::Config::new(
+            format!("http://{address}").parse().unwrap(),
+        ))
+        .unwrap();
+        let (trigger_tx, _trigger_rx) = futures::channel::mpsc::unbounded::<()>();
+        let config = OperatorConfig {
+            acceptor_id: Some("us".to_string()),
+            ..Default::default()
+        };
+        let ctx = Context::new(
+            client.clone(),
+            Arc::new(config),
+            Arc::new(Metrics::default()),
+            Arc::new(PoolWatchers::new(trigger_tx)),
+        );
+        (server, client, pool, ctx, http)
+    }
+
+    fn retention_teardown(pool: &OutpostPool, ctx: &Context, http: tokio::task::JoinHandle<()>) {
+        ctx.watchers.remove(&pool.uid().unwrap_or_default());
+        http.abort();
+    }
+
+    #[tokio::test]
+    async fn vanished_session_reconcile_preserves_pvc_for_resume() {
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+
+        apply(pool.clone(), &ctx).await.unwrap();
+
+        assert!(!*server.pod.lock().unwrap());
+        assert!(!*server.secret.lock().unwrap());
+        let retained = server.pvc.lock().unwrap().clone().unwrap();
+        assert_eq!(retained["metadata"]["uid"], "original-pvc");
+        assert_eq!(retained["spec"]["volumeName"], "original-pv");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(
+                retained["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT]
+                    .as_str()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+
+        let resume_session: crate::api::OutpostDevin = serde_json::from_value(serde_json::json!({
+            "metadata": {"session_id": "s", "outpost_id": "pool_x"},
+            "spec": {"kind": "resume", "platform": "linux"},
+            "status": {"phase": "pending", "session_status": "pending"},
+        }))
+        .unwrap();
+        let provider =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
+        provider.prepare(&resume_session).await.unwrap();
+
+        let resumed = server.pvc.lock().unwrap().clone().unwrap();
+        assert_eq!(resumed["metadata"]["uid"], "original-pvc");
+        assert_eq!(resumed["spec"]["volumeName"], "original-pv");
+        assert!(
+            resumed["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT].is_null()
+        );
+
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn vanished_session_retention_retries_and_keeps_existing_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let (server, _client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+
+        server.fail_pvc_patch.store(true, Ordering::SeqCst);
+        assert!(apply(pool.clone(), &ctx).await.is_err());
+        assert!(*server.secret.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        server.fail_pvc_patch.store(false, Ordering::SeqCst);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(
+                server.pvc.lock().unwrap().clone().unwrap()["metadata"]["annotations"]
+                    [super::super::ANNOTATION_SUSPENDED_AT]
+                    .as_str()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+
+        let deadline = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(deadline.clone());
+        }
+        *server.secret.lock().unwrap() = true;
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert!(!*server.secret.lock().unwrap());
+        assert_eq!(
+            server.pvc.lock().unwrap().clone().unwrap()["metadata"]["annotations"]
+                [super::super::ANNOTATION_SUSPENDED_AT],
+            serde_json::Value::String(deadline)
+        );
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn vanished_session_retention_expires_only_after_ttl() {
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+        let provider =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), pool.clone());
+
+        apply(pool.clone(), &ctx).await.unwrap();
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(
+                    (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+                );
+        }
+        provider.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        *server.pvc.lock().unwrap() = Some(retained_pvc());
+        {
+            let mut guard = server.pvc.lock().unwrap();
+            let pvc = guard.as_mut().unwrap();
+            pvc["metadata"]["annotations"][super::super::ANNOTATION_SUSPENDED_AT] =
+                serde_json::Value::String(
+                    (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+                );
+        }
+        let mut unlimited = (*pool).clone();
+        unlimited.spec.resume.snapshot_ttl_seconds = None;
+        let unlimited =
+            crate::snapshot::FilesystemSnapshotProvider::new(client.clone(), Arc::new(unlimited));
+        unlimited.gc().await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_some());
+        unlimited.on_terminate("s").await.unwrap();
+        assert!(server.pvc.lock().unwrap().is_none());
+
+        retention_teardown(&pool, &ctx, http);
     }
 }
