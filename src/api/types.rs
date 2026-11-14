@@ -28,8 +28,8 @@ pub enum StartupFailureReason {
     /// The image was still being pulled (`ErrImagePull` / `ImagePullBackOff`)
     /// when [`crate::config::OperatorConfig::worker_startup_timeout`] ran out.
     ImagePullTimeout,
-    /// The kubelet will never be able to pull the image (`InvalidImageName`,
-    /// `ErrImageNeverPull`).
+    /// The image cannot be used (`InvalidImageName`, `ErrImageNeverPull`,
+    /// or rejection under the worker contract in [`crate::controller`]).
     ImagePullError,
     /// The pod was still unschedulable when the startup timeout ran out.
     SchedulingTimeout,
@@ -46,8 +46,8 @@ impl StartupFailureReason {
     }
 }
 
-/// What a worker pod that could not start reported: the reason, the image it
-/// was waiting on (if the failure concerns one) and the kubelet's message.
+/// Why a session could not start, including the image when the failure
+/// concerns one and the operator's or kubelet's diagnostic message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupFailure {
     pub reason: StartupFailureReason,
