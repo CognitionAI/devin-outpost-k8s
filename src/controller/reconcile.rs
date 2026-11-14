@@ -27,8 +27,8 @@ use super::context::Context;
 use super::plan::{Action, Observed, next_claim_deadline, plan};
 use super::pod::{
     LABEL_MANAGED_BY, LABEL_POOL, WorkerPodParams, build_session_token_secret, build_worker_pod,
-    network_policy_name, pool_owner_ref, session_token_secret_name, worker_pod_name,
-    worker_static_base_url,
+    network_policy_name, pool_owner_ref, session_token_secret_name, validate_session_image,
+    worker_pod_name, worker_static_base_url,
 };
 use super::queue_watch::PoolWatchers;
 
@@ -471,18 +471,7 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
         Action::StartupFailed {
             session_id,
             failure,
-        } => {
-            warn!(
-                session = %session_id,
-                reason = failure.reason.as_str(),
-                image = failure.image.as_deref().unwrap_or(""),
-                message = %failure.message,
-                "worker cannot start; reporting the failure and giving the session up"
-            );
-            let intent = CleanupIntent::StartupFailure(failure.clone());
-            mark_cleanup_intent(sync, session_id, &intent).await?;
-            finish_cleanup(sync, session_id, intent).await
-        }
+        } => report_startup_failure(sync, session_id, failure).await,
         Action::ReplaceSucceededPod { session_id } => {
             delete_ignoring_missing(&sync.pods, &worker_pod_name(session_id)).await
         }
@@ -499,11 +488,39 @@ async fn execute(sync: &mut PoolSync<'_>, action: &Action) -> crate::Result<()> 
     }
 }
 
+async fn report_startup_failure(
+    sync: &mut PoolSync<'_>,
+    session_id: &str,
+    failure: &crate::api::StartupFailure,
+) -> crate::Result<()> {
+    warn!(
+        session = %session_id,
+        reason = failure.reason.as_str(),
+        image = failure.image.as_deref().unwrap_or(""),
+        message = %failure.message,
+        "worker cannot start; reporting the failure and giving the session up"
+    );
+    let intent = CleanupIntent::StartupFailure(failure.clone());
+    mark_cleanup_intent(sync, session_id, &intent).await?;
+    finish_cleanup(sync, session_id, intent).await
+}
+
 /// Claim (or renew) the session for a fresh connect token, then create its
 /// token secret, network policy (see [`crate::network_policy`]) and worker
 /// pod.
 async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Result<()> {
     let claimed = sync.outposts.claim(session_id).await?;
+    match validate_session_image(
+        sync.pool,
+        &claimed,
+        sync.ctx.config.default_image_build_repository.as_deref(),
+    ) {
+        Ok(()) => {}
+        Err(Error::SessionImageRejected(failure)) => {
+            return report_startup_failure(sync, session_id, &failure).await;
+        }
+        Err(error) => return Err(error),
+    }
     let connect_token = claimed.status.connect_token.as_deref().ok_or_else(|| {
         Error::Config(
             "claim response carried no connect_token (gateway not configured upstream)".into(),
@@ -1135,6 +1152,9 @@ mod tests {
         secret_annotations: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
         pod: Arc<std::sync::Mutex<bool>>,
         sessions: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        claimed_image: Arc<std::sync::Mutex<Option<String>>>,
+        report_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        pod_create_count: Arc<std::sync::atomic::AtomicUsize>,
         fail_pvc_patch: Arc<std::sync::atomic::AtomicBool>,
         fail_pvc_delete: Arc<std::sync::atomic::AtomicBool>,
         fail_pod_delete: Arc<std::sync::atomic::AtomicBool>,
@@ -1257,7 +1277,11 @@ mod tests {
                     ("POST", "s/claim") => {
                         return Json(serde_json::json!({
                             "metadata": {"session_id": "s", "outpost_id": "pool_x"},
-                            "spec": {"kind": "resume", "platform": "linux"},
+                            "spec": {
+                                "kind": "resume",
+                                "platform": "linux",
+                                "image": server.claimed_image.lock().unwrap().clone(),
+                            },
                             "status": {
                                 "phase": "claimed",
                                 "acceptor_id": "us",
@@ -1278,6 +1302,11 @@ mod tests {
                     }
                     ("POST", "s/startup-failure") => {
                         server.report_count.fetch_add(1, Ordering::SeqCst);
+                        server
+                            .report_bodies
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap());
                         let code = server.report_status.load(Ordering::SeqCst);
                         return match code {
                             200 => success(),
@@ -1319,6 +1348,7 @@ mod tests {
             }
             if path == format!("{ns}/pods") && method.as_str() == "POST" {
                 let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                server.pod_create_count.fetch_add(1, Ordering::SeqCst);
                 *server.pod.lock().unwrap() = true;
                 return Json(pod).into_response();
             }
@@ -1492,6 +1522,9 @@ mod tests {
             secret_annotations: Arc::new(Mutex::new(BTreeMap::new())),
             pod: Arc::new(Mutex::new(true)),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            claimed_image: Arc::new(Mutex::new(None)),
+            report_bodies: Arc::new(Mutex::new(Vec::new())),
+            pod_create_count: Arc::new(AtomicUsize::new(0)),
             fail_pvc_patch: Arc::new(AtomicBool::new(false)),
             fail_pvc_delete: Arc::new(AtomicBool::new(false)),
             fail_pod_delete: Arc::new(AtomicBool::new(false)),
@@ -1705,6 +1738,64 @@ mod tests {
         assert!(!*server.secret.lock().unwrap());
         assert!(!*server.pod.lock().unwrap());
         assert!(server.pvc.lock().unwrap().is_none());
+
+        retention_teardown(&pool, &ctx, http);
+    }
+
+    #[tokio::test]
+    async fn rejected_session_image_reports_startup_failure_before_creating_a_pod() {
+        use std::sync::atomic::Ordering;
+
+        let (server, client, pool, ctx, http) = retention_fixture(Some(3600)).await;
+        let mut pool = pool;
+        Arc::make_mut(&mut pool).spec.image_build = Some(crate::crd::ImageBuildConfig {
+            repository: Some("reg.example/drs".to_string()),
+            ..Default::default()
+        });
+        let evil = format!("evil.example/drs/org@sha256:{}", "a".repeat(64));
+        *server.claimed_image.lock().unwrap() = Some(evil.clone());
+        *server.pod.lock().unwrap() = false;
+        *server.secret.lock().unwrap() = false;
+        *server.pvc.lock().unwrap() = None;
+        let (outposts, provider) = sync_deps(&pool, &client);
+        let mut sync = PoolSync {
+            pool: &pool,
+            ctx: &ctx,
+            outposts: &outposts,
+            provider: &provider,
+            pods: Api::namespaced(client.clone(), "default"),
+            secrets: Api::namespaced(client.clone(), "default"),
+            pods_by_session: BTreeMap::new(),
+            snapshot_pending: false,
+        };
+
+        let expected_body = serde_json::json!({
+            "acceptor_id": "us",
+            "reason": "image_pull_error",
+            "image": evil,
+            "message": "session image must be pinned by digest under the pool's image repository",
+        });
+        server.report_status.store(500, Ordering::SeqCst);
+        assert!(start_worker(&mut sync, "s").await.is_err());
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 1);
+        assert_eq!(server.report_bodies.lock().unwrap()[0], expected_body);
+        assert_eq!(server.pod_create_count.load(Ordering::SeqCst), 0);
+        assert!(!*server.pod.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_none());
+        assert!(*server.secret.lock().unwrap());
+        assert_eq!(intent_kind(&server), "startup_failure");
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 0);
+
+        server.report_status.store(200, Ordering::SeqCst);
+        let ctx = restart_context(&client, &ctx);
+        apply(pool.clone(), &ctx).await.unwrap();
+        assert_eq!(server.report_count.load(Ordering::SeqCst), 2);
+        assert_eq!(server.report_bodies.lock().unwrap()[1], expected_body);
+        assert_eq!(server.pod_create_count.load(Ordering::SeqCst), 0);
+        assert!(!*server.pod.lock().unwrap());
+        assert!(server.pvc.lock().unwrap().is_none());
+        assert!(!*server.secret.lock().unwrap());
+        assert_eq!(server.release_count.load(Ordering::SeqCst), 0);
 
         retention_teardown(&pool, &ctx, http);
     }

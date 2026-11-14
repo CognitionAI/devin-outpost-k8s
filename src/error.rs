@@ -39,6 +39,9 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("session image rejected: {}", .0.message)]
+    SessionImageRejected(crate::api::StartupFailure),
+
     /// A referenced Kubernetes `Secret` (e.g. the pool PAT) was missing a key.
     #[error("secret {name:?} missing key {key:?}")]
     MissingSecretKey {

@@ -48,9 +48,14 @@
 //! - When the queue item carries `spec.image` the worker container runs that
 //!   image instead of the pool's: it is the session's DRS build, so it wins
 //!   even over `worker.overrides.image`. Such an image must honour the same
-//!   contract as the pool's worker image. With a state volume, the volume
-//!   starts empty and [`SEED_HOME_CONTAINER_NAME`] fills it from the image's
-//!   own home directory, so `resume.volumeDataSource` is not used.
+//!   contract as the pool's worker image.
+//!   When an image-build repository is configured, `spec.image` must be
+//!   pinned by digest under it; otherwise startup fails before a pod is created.
+//!   The control plane no longer knows the repository and can only verify
+//!   the scope/digest suffix reported by a build box whose blueprints run as root.
+//!   With a state volume, the volume starts empty and
+//!   [`SEED_HOME_CONTAINER_NAME`] fills it from the image's own home
+//!   directory, so `resume.volumeDataSource` is not used.
 //! - When the queue item carries `spec.image_build` the pod is a DRS build:
 //!   the worker gets `allowPrivilegeEscalation` (the capture reads the whole
 //!   filesystem through `sudo`) and a directory shared with
@@ -421,33 +426,81 @@ fn layer_volume_mount() -> VolumeMount {
     }
 }
 
+fn image_build_repository<'a>(
+    config: Option<&'a crate::crd::ImageBuildConfig>,
+    default_repository: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    config
+        .and_then(|config| config.repository.as_deref())
+        .map(|value| ("imageBuild.repository", value))
+        .or_else(|| default_repository.map(|value| ("DEVIN_IMAGE_BUILD_REPOSITORY", value)))
+}
+
+fn parse_image_build_repository(field: &str, repository: &str) -> Result<oci_client::Reference> {
+    static REPOSITORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\A[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]+([._-]+[a-z0-9]+)*)+\z",
+        )
+        .unwrap()
+    });
+    if !REPOSITORY.is_match(repository) {
+        return Err(Error::Config(format!(
+            "{field} must be host[:port]/path without a scheme, tag, digest or trailing slash"
+        )));
+    }
+    format!("{repository}:validation")
+        .parse::<oci_client::Reference>()
+        .map_err(|e| Error::Config(format!("{field}: {e}")))
+}
+
+fn image_is_in_repository(
+    image: &oci_client::Reference,
+    repository: &oci_client::Reference,
+) -> bool {
+    image.resolve_registry() == repository.resolve_registry()
+        && image
+            .repository()
+            .starts_with(&format!("{}/", repository.repository()))
+}
+
+pub(super) fn validate_session_image(
+    pool: &OutpostPool,
+    session: &OutpostDevin,
+    default_repository: Option<&str>,
+) -> Result<()> {
+    let (Some(image), Some((field, repository))) = (
+        session.spec.image.as_deref(),
+        image_build_repository(pool.spec.image_build.as_ref(), default_repository),
+    ) else {
+        return Ok(());
+    };
+    let repository = parse_image_build_repository(field, repository)?;
+    let allowed = image
+        .parse::<oci_client::Reference>()
+        .is_ok_and(|reference| {
+            reference.digest().is_some() && image_is_in_repository(&reference, &repository)
+        });
+    if !allowed {
+        return Err(Error::SessionImageRejected(crate::api::StartupFailure {
+            reason: crate::api::StartupFailureReason::ImagePullError,
+            image: Some(image.to_string()),
+            message: "session image must be pinned by digest under the pool's image repository"
+                .to_string(),
+        }));
+    }
+    Ok(())
+}
+
 fn image_build_target(
     config: &crate::crd::ImageBuildConfig,
     session: &OutpostDevin,
     default_repository: Option<&str>,
 ) -> Result<String> {
-    let repository = config
-        .repository
-        .as_deref()
-        .map(|value| ("imageBuild.repository", value))
-        .or_else(|| default_repository.map(|value| ("DEVIN_IMAGE_BUILD_REPOSITORY", value)));
+    let repository = image_build_repository(Some(config), default_repository);
     if let (Some((field, repository)), Some(path)) =
         (repository, session.spec.image_target_path.as_deref())
     {
-        static REPOSITORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(
-                r"\A[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]+([._-]+[a-z0-9]+)*)+\z",
-            )
-            .unwrap()
-        });
-        if !REPOSITORY.is_match(repository) {
-            return Err(Error::Config(format!(
-                "{field} must be host[:port]/path without a scheme, tag, digest or trailing slash"
-            )));
-        }
-        let prefix = format!("{repository}:validation")
-            .parse::<oci_client::Reference>()
-            .map_err(|e| Error::Config(format!("{field}: {e}")))?;
+        let prefix = parse_image_build_repository(field, repository)?;
         let target = format!("{repository}/{path}");
         let reference = target
             .parse::<oci_client::Reference>()
@@ -460,10 +513,7 @@ fn image_build_target(
         if !explicit_tag
             || reference.tag().is_none()
             || reference.digest().is_some()
-            || reference.resolve_registry() != prefix.resolve_registry()
-            || !reference
-                .repository()
-                .starts_with(&format!("{}/", prefix.repository()))
+            || !image_is_in_repository(&reference, &prefix)
         {
             return Err(Error::Config(
                 "spec.image_target_path must be a tagged path under the configured image repository, without a digest"
@@ -640,6 +690,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         operator_image,
         default_image_build_repository,
     } = params;
+    validate_session_image(pool, session, default_image_build_repository)?;
     let session_id = &session.metadata.session_id;
     let worker = &pool.spec.worker;
     let overrides = &worker.overrides;
@@ -1370,6 +1421,202 @@ mod tests {
         let spec = pod.spec.unwrap();
         assert!(spec.init_containers.is_none());
         assert!(drs_env(&spec.containers[0]).is_empty());
+    }
+
+    #[test]
+    fn session_image_must_be_in_the_configured_repository() {
+        let sha = format!("sha256:{}", "a".repeat(64));
+        let repo = "reg.example/drs";
+        for kind in [Kind::New, Kind::Resume] {
+            for (pool_repo, env_repo, image, expected) in [
+                (Some(repo), None, Some(format!("{repo}/org@{sha}")), Ok(())),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("{repo}/team/org@{sha}")),
+                    Ok(()),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("{repo}/org:job@{sha}")),
+                    Ok(()),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("evil.example/drs/org@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("reg.example/other/org@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("reg.example/drs-evil/org@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("reg.example/drs@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some(repo),
+                    None,
+                    Some(format!("{repo}/org:job")),
+                    Err("image"),
+                ),
+                (Some(repo), None, Some(format!("{repo}/org")), Err("image")),
+                (
+                    Some(repo),
+                    None,
+                    Some("not an image".to_string()),
+                    Err("image"),
+                ),
+                (None, None, Some("evil.example/x:job".to_string()), Ok(())),
+                (None, None, Some("not an image".to_string()), Ok(())),
+                (None, Some(repo), Some(format!("{repo}/org@{sha}")), Ok(())),
+                (
+                    None,
+                    Some(repo),
+                    Some(format!("evil.example/drs/org@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some(repo),
+                    Some("reg.example/other"),
+                    Some(format!("{repo}/org@{sha}")),
+                    Ok(()),
+                ),
+                (
+                    Some(repo),
+                    Some("reg.example/other"),
+                    Some(format!("reg.example/other/org@{sha}")),
+                    Err("image"),
+                ),
+                (
+                    Some("localhost:5000/drs"),
+                    None,
+                    Some(format!("localhost:5000/drs/org@{sha}")),
+                    Ok(()),
+                ),
+                (
+                    Some("localhost:5000/drs"),
+                    None,
+                    Some(format!("localhost:5001/drs/org@{sha}")),
+                    Err("image"),
+                ),
+                (Some(repo), None, None, Ok(())),
+                (
+                    Some("https://reg.example/drs"),
+                    Some(repo),
+                    Some(format!("{repo}/org@{sha}")),
+                    Err("config"),
+                ),
+            ] {
+                let mut pool = pool();
+                pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
+                    repository: pool_repo.map(str::to_string),
+                    ..Default::default()
+                });
+                let mut session = session("devin-1");
+                session.spec.kind = kind;
+                session.spec.image = image.clone();
+                let result = build_worker_pod(WorkerPodParams {
+                    default_image_build_repository: env_repo,
+                    ..params(&pool, &session)
+                });
+                match expected {
+                    Ok(()) => {
+                        let spec = result.unwrap().spec.unwrap();
+                        let worker = spec
+                            .containers
+                            .iter()
+                            .find(|c| c.name == "devin-worker")
+                            .unwrap();
+                        assert_eq!(
+                            worker.image.as_deref(),
+                            Some(image.as_deref().unwrap_or("img:default")),
+                            "{kind:?} {pool_repo:?} {env_repo:?} {image:?}"
+                        );
+                    }
+                    Err("image") => {
+                        let Err(Error::SessionImageRejected(failure)) = result else {
+                            panic!("expected SessionImageRejected for {kind:?} {image:?}");
+                        };
+                        assert_eq!(
+                            failure.reason,
+                            crate::api::StartupFailureReason::ImagePullError
+                        );
+                        assert_eq!(failure.image.as_deref(), image.as_deref());
+                        assert!(!failure.message.is_empty());
+                    }
+                    Err("config") => {
+                        let Err(Error::Config(message)) = result else {
+                            panic!("expected Error::Config for {kind:?} {image:?}");
+                        };
+                        assert!(message.contains("imageBuild.repository"), "{message}");
+                    }
+                    Err(other) => unreachable!("{other}"),
+                }
+            }
+        }
+
+        let mut pool = pool();
+        let mut agent = session("devin-1");
+        agent.spec.image = Some(format!("{repo}/org@{sha}"));
+        let pod = build_worker_pod(WorkerPodParams {
+            default_image_build_repository: Some(repo),
+            ..params(&pool, &agent)
+        })
+        .unwrap();
+        let spec = pod.spec.unwrap();
+        let worker = spec
+            .containers
+            .iter()
+            .find(|c| c.name == "devin-worker")
+            .unwrap();
+        assert_eq!(
+            worker.image.as_deref(),
+            Some(format!("{repo}/org@{sha}").as_str())
+        );
+        agent.spec.image = Some(format!("evil.example/drs/org@{sha}"));
+        assert!(matches!(
+            build_worker_pod(WorkerPodParams {
+                default_image_build_repository: Some(repo),
+                ..params(&pool, &agent)
+            }),
+            Err(Error::SessionImageRejected(_))
+        ));
+
+        pool.spec.image_build = Some(crate::crd::ImageBuildConfig {
+            repository: Some(repo.to_string()),
+            base_image: Some("other.example/base:stable".to_string()),
+            ..Default::default()
+        });
+        let mut build = session("devin-build");
+        build.spec.image_build = true;
+        build.spec.image_target = Some(format!("{repo}/org-1:job-1"));
+        build.spec.image = Some(format!("evil.example/drs/org@{sha}"));
+        assert!(matches!(
+            build_worker_pod(params(&pool, &build)),
+            Err(Error::SessionImageRejected(_))
+        ));
+        build.spec.image = None;
+        let pod = build_worker_pod(params(&pool, &build)).unwrap();
+        let spec = pod.spec.unwrap();
+        let worker = spec
+            .containers
+            .iter()
+            .find(|c| c.name == "devin-worker")
+            .unwrap();
+        assert_eq!(worker.image.as_deref(), Some("other.example/base:stable"));
     }
 
     #[test]
