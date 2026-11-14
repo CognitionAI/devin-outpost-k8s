@@ -130,6 +130,11 @@ pub struct Spec {
     /// blueprints run, cannot choose where its image goes.
     #[serde(default)]
     pub image_target: Option<String>,
+    /// For an image build: `path:tag` under the pool's image repository that the
+    /// built image is pushed to. Set by the control plane, like `image_target`,
+    /// so the build box cannot choose another org's path on a shared pool.
+    #[serde(default)]
+    pub image_target_path: Option<String>,
 }
 
 /// The egress restrictions of a session.
@@ -313,4 +318,27 @@ pub struct OutpostList {
     /// Whether more pages are available after `end_cursor`.
     #[serde(default)]
     pub has_next_page: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_target_path_is_optional_on_the_wire() {
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "kind": "new",
+            "platform": "linux",
+        }))
+        .unwrap();
+        assert_eq!(spec.image_target_path, None);
+
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "kind": "new",
+            "platform": "linux",
+            "image_target_path": "org-1:job-1",
+        }))
+        .unwrap();
+        assert_eq!(spec.image_target_path.as_deref(), Some("org-1:job-1"));
+    }
 }

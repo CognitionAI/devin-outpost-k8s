@@ -56,7 +56,8 @@
 //!   filesystem through `sudo`) and a directory shared with
 //!   [`PUSH_SIDECAR_CONTAINER_NAME`], a native sidecar running this
 //!   operator's image (`push-layer`, see [`crate::image_push`]) as root,
-//!   with the pool's registry credential, the base image and
+//!   with the pool's registry credential, the base image and the target —
+//!   the pool's repository plus `spec.image_target_path`, or
 //!   `spec.image_target`; it pushes what the capture puts in the directory.
 //!   The worker, where the customer's blueprints run with sudo, never sees
 //!   the credential or the target. Before the worker starts,
@@ -280,6 +281,9 @@ pub struct WorkerPodParams<'a> {
     /// This operator's image, run as the push sidecar of image-build pods
     /// (see [`crate::config::OperatorConfig::operator_image`]).
     pub operator_image: Option<&'a str>,
+    /// Operator-wide default image-build repository (see
+    /// [`crate::config::OperatorConfig::default_image_build_repository`]).
+    pub default_image_build_repository: Option<&'a str>,
 }
 
 /// Build the per-session `Secret` holding the gateway connect token under
@@ -417,6 +421,72 @@ fn layer_volume_mount() -> VolumeMount {
     }
 }
 
+fn image_build_target(
+    config: &crate::crd::ImageBuildConfig,
+    session: &OutpostDevin,
+    default_repository: Option<&str>,
+) -> Result<String> {
+    let repository = config
+        .repository
+        .as_deref()
+        .map(|value| ("imageBuild.repository", value))
+        .or_else(|| default_repository.map(|value| ("DEVIN_IMAGE_BUILD_REPOSITORY", value)));
+    if let (Some((field, repository)), Some(path)) =
+        (repository, session.spec.image_target_path.as_deref())
+    {
+        static REPOSITORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"\A[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]+([._-]+[a-z0-9]+)*)+\z",
+            )
+            .unwrap()
+        });
+        if !REPOSITORY.is_match(repository) {
+            return Err(Error::Config(format!(
+                "{field} must be host[:port]/path without a scheme, tag, digest or trailing slash"
+            )));
+        }
+        let prefix = format!("{repository}:validation")
+            .parse::<oci_client::Reference>()
+            .map_err(|e| Error::Config(format!("{field}: {e}")))?;
+        let target = format!("{repository}/{path}");
+        let reference = target
+            .parse::<oci_client::Reference>()
+            .map_err(|e| Error::Config(format!("spec.image_target_path: {e}")))?;
+        let explicit_tag = path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once(':'))
+            .is_some_and(|(_, tag)| !tag.is_empty());
+        if !explicit_tag
+            || reference.tag().is_none()
+            || reference.digest().is_some()
+            || reference.resolve_registry() != prefix.resolve_registry()
+            || !reference
+                .repository()
+                .starts_with(&format!("{}/", prefix.repository()))
+        {
+            return Err(Error::Config(
+                "spec.image_target_path must be a tagged path under the configured image repository, without a digest"
+                    .to_string(),
+            ));
+        }
+        return Ok(target);
+    }
+    if let Some(target) = &session.spec.image_target {
+        return Ok(target.clone());
+    }
+    if session.spec.image_target_path.is_some() && repository.is_none() {
+        return Err(Error::Config(
+            "image-build pool has no imageBuild.repository and DEVIN_IMAGE_BUILD_REPOSITORY is not set"
+                .to_string(),
+        ));
+    }
+    Err(Error::Config(format!(
+        "image-build session {} has no image_target or image_target_path",
+        session.metadata.session_id
+    )))
+}
+
 /// The push sidecar of an image-build pod: the operator image running
 /// [`image_push::SUBCOMMAND`] with the registry settings the worker must not
 /// have. A native sidecar (`restartPolicy: Always` on an init container,
@@ -428,6 +498,7 @@ fn push_sidecar_container(
     config: &crate::crd::ImageBuildConfig,
     session: &OutpostDevin,
     operator_image: Option<&str>,
+    default_image_build_repository: Option<&str>,
     base_image: &str,
 ) -> Result<Container> {
     let operator_image = operator_image.ok_or_else(|| {
@@ -437,12 +508,7 @@ fn push_sidecar_container(
                 .to_string(),
         )
     })?;
-    let target = session.spec.image_target.as_deref().ok_or_else(|| {
-        Error::Config(format!(
-            "image-build session {} has no image_target",
-            session.metadata.session_id
-        ))
-    })?;
+    let target = image_build_target(config, session, default_image_build_repository)?;
     let value = |name: &str, value: &str| EnvVar {
         name: name.to_string(),
         value: Some(value.to_string()),
@@ -451,7 +517,7 @@ fn push_sidecar_container(
     let mut env = vec![
         value(image_push::ENV_LAYER_DIR, image_push::LAYER_DIR),
         value(image_push::ENV_BASE_IMAGE, base_image),
-        value(image_push::ENV_TARGET, target),
+        value(image_push::ENV_TARGET, &target),
     ];
     if config.insecure_registry {
         env.push(value(image_push::ENV_REGISTRY_INSECURE, "1"));
@@ -572,6 +638,7 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
         provider_annotations,
         network_policy_name,
         operator_image,
+        default_image_build_repository,
     } = params;
     let session_id = &session.metadata.session_id;
     let worker = &pool.spec.worker;
@@ -681,7 +748,13 @@ pub fn build_worker_pod(params: WorkerPodParams<'_>) -> Result<Pod> {
     }
     if session.spec.image_build {
         let config = pool.spec.image_build.clone().unwrap_or_default();
-        let sidecar = push_sidecar_container(&config, session, operator_image, image)?;
+        let sidecar = push_sidecar_container(
+            &config,
+            session,
+            operator_image,
+            default_image_build_repository,
+            image,
+        )?;
         operator_env.push(EnvVar {
             name: image_push::ENV_LAYER_DIR.to_string(),
             value: Some(image_push::LAYER_DIR.to_string()),
@@ -833,6 +906,7 @@ mod tests {
                 image: None,
                 image_build: false,
                 image_target: None,
+                image_target_path: None,
             },
             status: Status {
                 phase: Phase::Claimed,
@@ -858,7 +932,18 @@ mod tests {
             provider_annotations: &NO_ANNOTATIONS,
             network_policy_name: None,
             operator_image: Some("ghcr.io/cognitionai/devin-outposts-k8s:sha-1"),
+            default_image_build_repository: None,
         }
+    }
+
+    fn drs_env(container: &Container) -> BTreeMap<&str, &EnvVar> {
+        container
+            .env
+            .iter()
+            .flatten()
+            .filter(|e| e.name.starts_with("DEVIN_DRS_"))
+            .map(|e| (e.name.as_str(), e))
+            .collect()
     }
 
     #[test]
@@ -939,15 +1024,6 @@ mod tests {
 
     #[test]
     fn only_an_image_build_pod_gets_a_push_sidecar_and_the_worker_never_the_credential() {
-        fn drs_env(container: &Container) -> BTreeMap<&str, &EnvVar> {
-            container
-                .env
-                .iter()
-                .flatten()
-                .filter(|e| e.name.starts_with("DEVIN_DRS_"))
-                .map(|e| (e.name.as_str(), e))
-                .collect()
-        }
         let mut pool = pool();
         pool.spec
             .worker
@@ -1109,6 +1185,191 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn image_build_target_is_the_pool_repository_plus_the_queue_path() {
+        let mut pool = pool();
+        pool.spec.image_build = Some(crate::crd::ImageBuildConfig::default());
+        let mut build = session("devin-build");
+        build.spec.image_build = true;
+        let legacy = Some("other.example/legacy:job");
+        let repository = Some("reg.example/devin/drs");
+        let path = Some("org-1:job-1");
+        for (pool_repo, env_repo, target_path, legacy_target, expected) in [
+            (
+                repository,
+                None,
+                path,
+                None,
+                Ok("reg.example/devin/drs/org-1:job-1"),
+            ),
+            (
+                repository,
+                None,
+                path,
+                legacy,
+                Ok("reg.example/devin/drs/org-1:job-1"),
+            ),
+            (None, None, None, legacy, Ok("other.example/legacy:job")),
+            (None, None, path, legacy, Ok("other.example/legacy:job")),
+            (
+                repository,
+                None,
+                None,
+                legacy,
+                Ok("other.example/legacy:job"),
+            ),
+            (repository, None, None, None, Err(&["image_target"][..])),
+            (
+                None,
+                None,
+                path,
+                None,
+                Err(&["imageBuild.repository", "DEVIN_IMAGE_BUILD_REPOSITORY"][..]),
+            ),
+            (
+                None,
+                Some("reg.example/default"),
+                path,
+                None,
+                Ok("reg.example/default/org-1:job-1"),
+            ),
+            (
+                Some("reg.example/pool"),
+                Some("reg.example/default"),
+                path,
+                None,
+                Ok("reg.example/pool/org-1:job-1"),
+            ),
+            (
+                Some("localhost:5000/devin/drs"),
+                None,
+                path,
+                None,
+                Ok("localhost:5000/devin/drs/org-1:job-1"),
+            ),
+            (None, None, None, None, Err(&["image_target"][..])),
+            (
+                None,
+                None,
+                Some("../malformed"),
+                legacy,
+                Ok("other.example/legacy:job"),
+            ),
+        ] {
+            pool.spec.image_build.as_mut().unwrap().repository = pool_repo.map(str::to_string);
+            build.spec.image_target = legacy_target.map(str::to_string);
+            build.spec.image_target_path = target_path.map(str::to_string);
+            let result = build_worker_pod(WorkerPodParams {
+                default_image_build_repository: env_repo,
+                ..params(&pool, &build)
+            });
+            match expected {
+                Ok(target) => {
+                    let spec = result.unwrap().spec.unwrap();
+                    let worker = spec
+                        .containers
+                        .iter()
+                        .find(|c| c.name == "devin-worker")
+                        .unwrap();
+                    assert!(
+                        worker
+                            .env
+                            .iter()
+                            .flatten()
+                            .all(|env| env.name != "DEVIN_IMAGE_BUILD_REPOSITORY")
+                    );
+                    assert_eq!(
+                        drs_env(worker).keys().copied().collect::<Vec<_>>(),
+                        [image_push::ENV_LAYER_DIR],
+                        "{pool_repo:?} {env_repo:?} {target_path:?} {legacy_target:?}"
+                    );
+                    let sidecar = spec
+                        .init_containers
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c.name == PUSH_SIDECAR_CONTAINER_NAME)
+                        .unwrap();
+                    assert_eq!(
+                        drs_env(sidecar)[image_push::ENV_TARGET].value.as_deref(),
+                        Some(target),
+                        "{pool_repo:?} {env_repo:?} {target_path:?} {legacy_target:?}"
+                    );
+                }
+                Err(fields) => {
+                    let Error::Config(message) = result.unwrap_err() else {
+                        panic!(
+                            "expected Error::Config for {pool_repo:?} {env_repo:?} {target_path:?} {legacy_target:?}"
+                        );
+                    };
+                    for field in fields {
+                        assert!(message.contains(field), "{message} names {field}");
+                    }
+                }
+            }
+        }
+
+        pool.spec.image_build.as_mut().unwrap().repository = repository.map(str::to_string);
+        build.spec.image_target = legacy.map(str::to_string);
+        for target_path in [
+            "../x:job".to_string(),
+            "/x:job".to_string(),
+            format!("x@sha256:{}", "a".repeat(64)),
+            "x".to_string(),
+            "x:".to_string(),
+            format!("x:job@sha256:{}", "a".repeat(64)),
+            "x//y:job".to_string(),
+            "https://evil.example/x:job".to_string(),
+        ] {
+            build.spec.image_target_path = Some(target_path.clone());
+            let Err(Error::Config(message)) = build_worker_pod(params(&pool, &build)) else {
+                panic!("expected Error::Config for path {target_path:?}");
+            };
+            assert!(
+                message.contains("spec.image_target_path"),
+                "{message} for {target_path:?}"
+            );
+        }
+
+        build.spec.image_target_path = path.map(str::to_string);
+        for bad in [
+            "https://reg.example/drs",
+            "reg.example/drs:tag",
+            "reg.example/drs@sha256:abc",
+            "reg.example/drs/",
+            "reg.example",
+            "",
+            "reg.example:123456/drs",
+            "reg.example/drs\n",
+        ] {
+            for (pool_repo, env_repo, field) in [
+                (
+                    Some(bad),
+                    Some("reg.example/default"),
+                    "imageBuild.repository",
+                ),
+                (None, Some(bad), "DEVIN_IMAGE_BUILD_REPOSITORY"),
+            ] {
+                pool.spec.image_build.as_mut().unwrap().repository = pool_repo.map(str::to_string);
+                let Err(Error::Config(message)) = build_worker_pod(WorkerPodParams {
+                    default_image_build_repository: env_repo,
+                    ..params(&pool, &build)
+                }) else {
+                    panic!("expected Error::Config for repository {bad:?} from {field}");
+                };
+                assert!(message.contains(field), "{message} for {bad:?}");
+            }
+        }
+
+        pool.spec.image_build.as_mut().unwrap().repository = Some("bad repo".to_string());
+        let mut agent = session("devin-agent");
+        agent.spec.image_target_path = Some("../malformed".to_string());
+        let pod = build_worker_pod(params(&pool, &agent)).unwrap();
+        let spec = pod.spec.unwrap();
+        assert!(spec.init_containers.is_none());
+        assert!(drs_env(&spec.containers[0]).is_empty());
     }
 
     #[test]

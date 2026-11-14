@@ -63,20 +63,26 @@ pub struct OutpostPoolSpec {
 /// What the push sidecar of an image-build session needs (see
 /// [`crate::image_push`]). Only that sidecar
 /// sees these; the worker container running the customer's blueprints gets
-/// none of them. Where the image goes comes from the queue entry
-/// (`spec.image_target`), not from here.
+/// none of them. The pool supplies the repository prefix; the queue entry
+/// supplies the path under it (or the full legacy target).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageBuildConfig {
+    /// `host[:port]/path` prefix, no scheme, tag or digest, that this pool's
+    /// built images are pushed under. `None` => the operator's
+    /// `DEVIN_IMAGE_BUILD_REPOSITORY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+
     /// `Secret` in the pool's namespace whose `username` and `password` keys
-    /// can push to the pool's image repository. Push-only, for that path,
-    /// is enough. `None` => the registry takes anonymous pushes.
+    /// can push to `repository`. Push-only, for that path, is enough.
+    /// `None` => the registry takes anonymous pushes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_secret_name: Option<String>,
 
     /// Base image for the build worker and publisher unless `spec.image` is
-    /// set. Must live in the same registry as the target. `None` uses the
-    /// pool's worker image.
+    /// set. Must live in the same registry as `repository` (or the legacy
+    /// target). `None` uses the pool's worker image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
 

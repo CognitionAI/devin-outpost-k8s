@@ -32,6 +32,9 @@ pub struct OperatorConfig {
     /// image-build sessions.
     pub operator_image: Option<String>,
 
+    /// Default for [`crate::crd::ImageBuildConfig::repository`].
+    pub default_image_build_repository: Option<String>,
+
     /// How long to wait between full re-list/reconcile passes of a pool's queue.
     pub reconcile_interval: Duration,
 
@@ -80,6 +83,7 @@ impl Default for OperatorConfig {
             default_api_url: crate::api::DEFAULT_API_URL.to_string(),
             default_worker_image: crate::controller::DEFAULT_WORKER_IMAGE.to_string(),
             operator_image: None,
+            default_image_build_repository: None,
             reconcile_interval: Duration::from_secs(30),
             claim_renew_margin: Duration::from_secs(60),
             acceptor_id: None,
@@ -108,6 +112,7 @@ impl OperatorConfig {
     /// | `DEVIN_API_URL` | [`Self::default_api_url`] |
     /// | `DEVIN_WORKER_IMAGE` | [`Self::default_worker_image`] |
     /// | `OPERATOR_IMAGE` | [`Self::operator_image`] |
+    /// | `DEVIN_IMAGE_BUILD_REPOSITORY` | [`Self::default_image_build_repository`] |
     /// | `RECONCILE_INTERVAL_SECONDS` | [`Self::reconcile_interval`] |
     /// | `CLAIM_RENEW_MARGIN_SECONDS` | [`Self::claim_renew_margin`] |
     /// | `ACCEPTOR_ID` | [`Self::acceptor_id`] |
@@ -183,6 +188,7 @@ impl OperatorConfig {
             default_worker_image: get("DEVIN_WORKER_IMAGE")
                 .unwrap_or(defaults.default_worker_image),
             operator_image: get("OPERATOR_IMAGE"),
+            default_image_build_repository: get("DEVIN_IMAGE_BUILD_REPOSITORY"),
             reconcile_interval: parse_secs(
                 "RECONCILE_INTERVAL_SECONDS",
                 defaults.reconcile_interval,
@@ -218,6 +224,7 @@ mod tests {
             ("WATCH_NAMESPACE", "outposts"),
             ("DEVIN_API_URL", "https://api.example.com"),
             ("DEVIN_WORKER_IMAGE", "img:tag"),
+            ("DEVIN_IMAGE_BUILD_REPOSITORY", "reg.example/devin/drs"),
             ("RECONCILE_INTERVAL_SECONDS", "12"),
             ("CLAIM_RENEW_MARGIN_SECONDS", "34"),
             ("ACCEPTOR_ID", "my-acceptor"),
@@ -240,6 +247,10 @@ mod tests {
         assert_eq!(config.watch_namespace.as_deref(), Some("outposts"));
         assert_eq!(config.default_api_url, "https://api.example.com");
         assert_eq!(config.default_worker_image, "img:tag");
+        assert_eq!(
+            config.default_image_build_repository.as_deref(),
+            Some("reg.example/devin/drs")
+        );
         assert_eq!(config.reconcile_interval, Duration::from_secs(12));
         assert_eq!(config.claim_renew_margin, Duration::from_secs(34));
         assert_eq!(config.acceptor_id.as_deref(), Some("my-acceptor"));
@@ -265,6 +276,7 @@ mod tests {
         assert_eq!(config.metrics_addr, defaults.metrics_addr);
         assert_eq!(config.watch_namespace, None);
         assert_eq!(config.acceptor_id, None);
+        assert_eq!(config.default_image_build_repository, None);
         assert_eq!(config.network_policy_enforcement, Enforcement::Auto);
         assert_eq!(config.default_api_url, defaults.default_api_url);
         assert!(config.leader_election);
