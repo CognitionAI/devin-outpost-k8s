@@ -393,6 +393,7 @@ mod tests {
                 image: None,
                 image_build: false,
                 image_target: None,
+                image_target_path: None,
             },
             status: Status {
                 phase,

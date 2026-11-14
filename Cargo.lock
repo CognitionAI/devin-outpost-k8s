@@ -556,6 +556,7 @@ dependencies = [
  "libc",
  "oci-client",
  "prometheus-client",
+ "regex",
  "reqwest",
  "rustls",
  "schemars",

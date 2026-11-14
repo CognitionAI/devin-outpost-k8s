@@ -571,6 +571,7 @@ async fn start_worker(sync: &mut PoolSync<'_>, session_id: &str) -> crate::Resul
         provider_annotations: &prepared.pod_annotations,
         network_policy_name: policy_name.as_deref(),
         operator_image: sync.ctx.config.operator_image.as_deref(),
+        default_image_build_repository: sync.ctx.config.default_image_build_repository.as_deref(),
     })?;
 
     let allow = match enforced_through {

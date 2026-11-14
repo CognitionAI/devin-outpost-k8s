@@ -58,7 +58,7 @@
                     "nullable": true,
                     "properties": {
                       "baseImage": {
-                        "description": "Base image for the build worker and publisher unless `spec.image` is\nset. Must live in the same registry as the target. `None` uses the\npool's worker image.",
+                        "description": "Base image for the build worker and publisher unless `spec.image` is\nset. Must live in the same registry as `repository` (or the legacy\ntarget). `None` uses the pool's worker image.",
                         "nullable": true,
                         "type": "string"
                       },
@@ -68,7 +68,12 @@
                         "type": "boolean"
                       },
                       "registrySecretName": {
-                        "description": "`Secret` in the pool's namespace whose `username` and `password` keys\ncan push to the pool's image repository. Push-only, for that path,\nis enough. `None` => the registry takes anonymous pushes.",
+                        "description": "`Secret` in the pool's namespace whose `username` and `password` keys\ncan push to `repository`. Push-only, for that path, is enough.\n`None` => the registry takes anonymous pushes.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "repository": {
+                        "description": "`host[:port]/path` prefix, no scheme, tag or digest, that this pool's\nbuilt images are pushed under. `None` => the operator's\n`DEVIN_IMAGE_BUILD_REPOSITORY`.",
                         "nullable": true,
                         "type": "string"
                       }

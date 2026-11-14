@@ -20,6 +20,11 @@ spec:
 
   maxConcurrentSessions: 10
 
+  # imageBuild:
+  #   repository: reg.example/devin/drs
+  #   registrySecretName: registry-push
+  #   baseImage: reg.example/devin/base:stable
+
   # How resume-kind sessions are served. The policy alone decides whether
   # snapshots are taken on suspend: StartFresh | GkeSnapshot | FilesystemSnapshot.
   resume:
