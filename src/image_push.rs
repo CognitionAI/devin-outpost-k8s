@@ -20,9 +20,9 @@
 //! 2. The capture writes [`LAYER_FILE`], a gzip tar layer with whiteouts,
 //!    whole (renamed into place).
 //! 3. The sidecar appends it to the base image ([`ENV_BASE_IMAGE`]), pushes
-//!    the result to the resolved target ([`ENV_TARGET`]: the
-//!    pool's repository plus `spec.image_target_path`, or
-//!    `spec.image_target`) and writes [`RESULT_FILE`] atomically:
+//!    the result to [`ENV_TARGET`] (resolved as specified by
+//!    [`crate::controller`]'s pod-module worker contract) and writes
+//!    [`RESULT_FILE`] atomically:
 //!    `{"image": "<repository>@sha256:..."}` or `{"error": "..."}`.
 //! 4. The build job reads the result through the worker.
 //!
